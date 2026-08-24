@@ -29,6 +29,15 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 SUBMISSION_ID_PREFIX = "sub_"
 
+# ``sub_`` followed by a uuid4 in hex.
+SUBMISSION_ID_MAX_LENGTH = len(SUBMISSION_ID_PREFIX) + 32
+
+# Stated once so that every error mentioning the rule words it identically.
+ENDPOINT_ID_RULE = (
+    f"Endpoint IDs are {ENDPOINT_ID_MIN_LENGTH}-{ENDPOINT_ID_MAX_LENGTH} characters using "
+    "lowercase letters, digits, '-' and '_', and must start and end with a letter or digit."
+)
+
 
 def is_valid_endpoint_id(value: str) -> bool:
     """

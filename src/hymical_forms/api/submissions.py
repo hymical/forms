@@ -11,14 +11,18 @@ from http import HTTPStatus
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 from python_multipart.exceptions import ParseError
+from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.formparsers import FormParser, MultiPartException, MultiPartParser
 
+from hymical_forms import storage
 from hymical_forms.config import Settings
+from hymical_forms.db import SessionDep
 from hymical_forms.errors import ApiError, ErrorResponse
 from hymical_forms.ingestion import (
-    ENDPOINT_ID_MAX_LENGTH,
-    ENDPOINT_ID_MIN_LENGTH,
+    ENDPOINT_ID_RULE,
+    Submission,
     build_submission,
     is_valid_endpoint_id,
 )
@@ -46,10 +50,46 @@ class InvalidEndpointId(ApiError):
         """
         state the endpoint identifier rules the request failed
         """
+        super().__init__(f"The path does not address a form endpoint. {ENDPOINT_ID_RULE}")
+
+
+class EndpointNotFound(ApiError):
+    """
+    raised when the identifier is well formed but no such endpoint exists
+    """
+
+    # Deliberately the same status as a malformed ID: from outside, both mean the
+    # path does not address a form endpoint. The code tells the two apart.
+    status_code = HTTPStatus.NOT_FOUND
+    code = "endpoint_not_found"
+
+    def __init__(self, endpoint_id: str) -> None:
+        """
+        name the endpoint identifier that could not be resolved
+        :param endpoint_id: the identifier taken from the request path
+        """
         super().__init__(
-            "The path does not address a form endpoint. Endpoint IDs are "
-            f"{ENDPOINT_ID_MIN_LENGTH}-{ENDPOINT_ID_MAX_LENGTH} characters using lowercase "
-            "letters, digits, '-' and '_', and must start and end with a letter or digit.",
+            f"No form endpoint with the ID {endpoint_id!r} exists.",
+            details={"endpoint_id": endpoint_id},
+        )
+
+
+class EndpointInactive(ApiError):
+    """
+    raised when the endpoint exists but is not accepting submissions
+    """
+
+    status_code = HTTPStatus.CONFLICT
+    code = "endpoint_inactive"
+
+    def __init__(self, endpoint_id: str) -> None:
+        """
+        name the endpoint identifier that is not accepting submissions
+        :param endpoint_id: the identifier taken from the request path
+        """
+        super().__init__(
+            f"The form endpoint {endpoint_id!r} is not accepting submissions.",
+            details={"endpoint_id": endpoint_id},
         )
 
 
@@ -132,24 +172,37 @@ class SubmissionAccepted(BaseModel):
     summary="Submit a form",
     responses={
         400: {"model": ErrorResponse, "description": "Malformed form body"},
-        404: {"model": ErrorResponse, "description": "Invalid endpoint ID"},
+        404: {"model": ErrorResponse, "description": "Invalid or unknown endpoint ID"},
+        409: {"model": ErrorResponse, "description": "Endpoint is not accepting submissions"},
         413: {"model": ErrorResponse, "description": "Request body too large"},
         415: {"model": ErrorResponse, "description": "Unsupported content type"},
         422: {"model": ErrorResponse, "description": "Submission rejected by an ingestion rule"},
+        503: {"model": ErrorResponse, "description": "Database unavailable"},
     },
 )
-async def submit(endpoint_id: str, request: Request) -> SubmissionAccepted:
+async def submit(endpoint_id: str, request: Request, session: SessionDep) -> SubmissionAccepted:
     """
-    accept an html form submission
+    accept an html form submission and store it
     :param endpoint_id: endpoint identifier taken from the request path
     :param request: the incoming request, read for its content type and body
-    :returns: an acknowledgement carrying the generated submission metadata
+    :param session: the session this request does its database work through
+    :returns: an acknowledgement carrying the stored submission's metadata
     """
     # The response is 202 Accepted rather than 201 Created: the submission is
-    # acknowledged as received and well-formed, but Hymical Forms does not yet
-    # persist it or deliver it anywhere.
+    # stored, but the delivery it was accepted for has not happened yet.
+    #
+    # The endpoint is resolved before the body is parsed, so an unknown endpoint
+    # costs one indexed lookup rather than a full parse of a body we would throw
+    # away. This handler must stay ``async`` to stream the body, so each blocking
+    # database call is handed to a worker thread instead of stalling the loop.
     if not is_valid_endpoint_id(endpoint_id):
         raise InvalidEndpointId()
+
+    endpoint = await run_in_threadpool(storage.get_endpoint, session, endpoint_id)
+    if endpoint is None:
+        raise EndpointNotFound(endpoint_id)
+    if not endpoint.is_active:
+        raise EndpointInactive(endpoint_id)
 
     media_type = _media_type(request.headers.get("content-type"))
     if media_type not in SUPPORTED_MEDIA_TYPES:
@@ -164,12 +217,27 @@ async def submit(endpoint_id: str, request: Request) -> SubmissionAccepted:
         max_field_value_length=settings.max_field_value_length,
     )
 
+    await run_in_threadpool(_store, session, submission)
+
     return SubmissionAccepted(
         submission_id=submission.id,
         endpoint_id=submission.endpoint_id,
         received_at=submission.received_at,
         field_count=submission.field_count,
     )
+
+
+def _store(session: Session, submission: Submission) -> None:
+    """
+    write the submission and make it durable
+    :param session: the session to write through
+    :param submission: the validated submission to store
+    """
+    # The commit happens inside the handler, not in the session dependency's
+    # teardown, so that a failure still becomes an error response. Teardown runs
+    # after the response has been sent, where raising could no longer change it.
+    storage.add_submission(session, submission)
+    session.commit()
 
 
 async def _parse_form(

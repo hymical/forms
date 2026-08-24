@@ -20,6 +20,7 @@ from typing import Any, ClassVar
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -107,6 +108,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     """
     app.add_exception_handler(ApiError, _handle_api_error)
     app.add_exception_handler(SubmissionRejected, _handle_submission_rejected)
+    app.add_exception_handler(SQLAlchemyError, _handle_storage_error)
     app.add_exception_handler(StarletteHTTPException, _handle_http_exception)
     app.add_exception_handler(RequestValidationError, _handle_request_validation_error)
     app.add_exception_handler(Exception, _handle_unexpected_error)
@@ -145,6 +147,23 @@ async def _handle_submission_rejected(request: Request, exc: Exception) -> Respo
     )
 
 
+async def _handle_storage_error(request: Request, exc: Exception) -> Response:
+    """
+    render a database failure without describing it
+    :param request: the request being handled
+    :param exc: the raised exception, always a SQLAlchemyError
+    :returns: the envelope response, with a 503 status
+    """
+    # Driver messages carry table names, SQL text and sometimes connection
+    # details, so none of the exception reaches the client. 503 rather than 500
+    # because the request itself was fine and retrying it may well succeed.
+    return error_response(
+        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        code="storage_unavailable",
+        message="The submission could not be stored. Try again shortly.",
+    )
+
+
 async def _handle_http_exception(request: Request, exc: Exception) -> Response:
     """
     render routing-level errors such as unknown paths and wrong methods
@@ -168,10 +187,21 @@ async def _handle_request_validation_error(request: Request, exc: Exception) -> 
     :returns: the envelope response, with a 422 status
     """
     assert isinstance(exc, RequestValidationError)
+    # Only the location and pydantic's short explanation are relayed. The raw
+    # error carries the offending input, which may be user data we should not
+    # reflect back, and internal type names that mean nothing to a caller.
+    fields = [
+        {
+            "field": ".".join(str(part) for part in error["loc"][1:]) or None,
+            "issue": error["msg"],
+        }
+        for error in exc.errors()
+    ]
     return error_response(
         status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
         code="invalid_request",
-        message="The request could not be validated.",
+        message="The request body could not be validated.",
+        details={"fields": fields} if fields else None,
     )
 
 

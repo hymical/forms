@@ -61,6 +61,12 @@ local_settings.py
 db.sqlite3
 db.sqlite3-journal
 
+# Local SQLite databases, e.g. FORMS_DATABASE_URL=sqlite:///./forms.db
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
 # Flask stuff:
 instance/
 .webassets-cache

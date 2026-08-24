@@ -24,6 +24,12 @@ class Settings(BaseSettings):
         frozen=True,
     )
 
+    database_url: str = Field(
+        description=(
+            "SQLAlchemy database URL. PostgreSQL is the intended production database, "
+            "for example postgresql+psycopg://user:password@localhost:5432/forms."
+        ),
+    )
     max_body_bytes: int = Field(
         default=256 * 1024,
         ge=1,

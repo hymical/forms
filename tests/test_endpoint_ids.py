@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from conftest import create_endpoint
 from hymical_forms.ingestion import is_valid_endpoint_id
 
 VALID_IDS = [
@@ -48,8 +49,12 @@ def test_rejects_malformed_identifiers(endpoint_id: str) -> None:
 
 
 @pytest.mark.parametrize("endpoint_id", VALID_IDS)
-def test_valid_identifiers_are_addressable_over_http(client: TestClient, endpoint_id: str) -> None:
-    response = client.post(f"/f/{endpoint_id}", data={"email": "dev@example.com"})
+def test_valid_identifiers_are_addressable_once_registered(
+    empty_client: TestClient, endpoint_id: str
+) -> None:
+    create_endpoint(empty_client, endpoint_id)
+
+    response = empty_client.post(f"/f/{endpoint_id}", data={"email": "dev@example.com"})
 
     assert response.status_code == 202
     assert response.json()["endpoint_id"] == endpoint_id
