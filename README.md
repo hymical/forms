@@ -1,10 +1,8 @@
 <p align="center">
-  <img src="docs/images/logo_symbol_transparent.png"
+  <img src="docs/images/logo1.png"
        alt="Hymical Forms logo"
-       width="120">
+       width="600">
 </p>
-
-<h1 align="center">Hymical Forms</h1>
 
 <p align="center">
   Reliable form ingestion and webhook delivery for developers.
