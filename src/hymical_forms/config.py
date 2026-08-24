@@ -1,0 +1,44 @@
+"""Application settings.
+
+Every setting is read from a ``FORMS_``-prefixed environment variable (or a local
+``.env`` file). Settings are added only when the code actually uses them, so this
+model is currently limited to the ingestion boundary's protective limits.
+"""
+
+from __future__ import annotations
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Runtime configuration for a Hymical Forms process."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="FORMS_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        frozen=True,
+    )
+
+    max_body_bytes: int = Field(
+        default=256 * 1024,
+        ge=1,
+        description="Largest request body accepted, in bytes. File uploads are not supported.",
+    )
+    max_fields: int = Field(
+        default=100,
+        ge=1,
+        description="Largest number of name/value pairs accepted in one submission.",
+    )
+    max_field_name_length: int = Field(
+        default=128,
+        ge=1,
+        description="Largest field name accepted, in characters.",
+    )
+    max_field_value_length: int = Field(
+        default=16 * 1024,
+        ge=1,
+        description="Largest field value accepted, in characters.",
+    )
