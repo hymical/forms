@@ -13,7 +13,6 @@ from hymical_forms import __version__
 from hymical_forms.api import endpoints, health, submissions
 from hymical_forms.config import Settings
 from hymical_forms.db import create_engine_from_url, create_session_factory, init_db
-from hymical_forms.delivery import create_webhook_client
 from hymical_forms.errors import register_exception_handlers
 from hymical_forms.middleware import BodySizeLimitMiddleware
 
@@ -21,9 +20,9 @@ DESCRIPTION = """\
 Hymical Forms accepts HTML form submissions over HTTP so that developers do not
 have to run a form backend of their own.
 
-Submissions are parsed, validated and stored against a registered endpoint, then
-delivered once to that endpoint's webhook if it has one. There are no automatic
-retries yet.
+Submissions are parsed, validated, and stored against a registered endpoint
+together with the durable obligation to deliver them. A separate worker process
+performs the webhook delivery and retries it.
 """
 
 
@@ -39,7 +38,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # that already exists, which also means a changed column needs manual work.
     init_db(app.state.engine)
     yield
-    await app.state.webhook_client.aclose()
     app.state.engine.dispose()
 
 
@@ -67,9 +65,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.engine = engine
     app.state.session_factory = create_session_factory(engine)
-    # One outbound client for the process, so webhook connections are pooled
-    # rather than renegotiated per submission. Closed again in the lifespan.
-    app.state.webhook_client = create_webhook_client(settings)
+    # The API process holds no outbound HTTP client. Webhook delivery belongs to
+    # the worker, and having nothing to send with is the plainest way to keep the
+    # ingestion path free of network calls.
 
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_body_bytes)
     register_exception_handlers(app)

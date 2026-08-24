@@ -15,7 +15,7 @@ import json
 import secrets
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urlsplit
@@ -36,6 +36,10 @@ ALLOWED_SCHEMES = ("http", "https")
 DELIVERY_ATTEMPT_ID_PREFIX = "att_"
 DELIVERY_ATTEMPT_ID_MAX_LENGTH = len(DELIVERY_ATTEMPT_ID_PREFIX) + 32
 
+WEBHOOK_DELIVERY_ID_PREFIX = "whd_"
+WEBHOOK_DELIVERY_ID_MAX_LENGTH = len(WEBHOOK_DELIVERY_ID_PREFIX) + 32
+DELIVERY_STATE_MAX_LENGTH = 16
+
 # Failure text is written by whatever the destination did, so it is attacker
 # influenced and has to be bounded before it reaches a column.
 DELIVERY_ERROR_MAX_LENGTH = 500
@@ -54,6 +58,32 @@ class DeliveryOutcome(StrEnum):
     NETWORK_ERROR = "network_error"
 
 
+class DeliveryState(StrEnum):
+    """
+    where a logical delivery has got to
+    """
+
+    # ``pending`` is owed and waiting for its due time, ``processing`` is claimed
+    # by a worker and holding a lease, and the last two are terminal.
+    PENDING = "pending"
+    PROCESSING = "processing"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+
+
+TERMINAL_STATES = (DeliveryState.DELIVERED, DeliveryState.FAILED)
+
+# Statuses below 500 that still describe a condition worth waiting out. Every
+# other 4xx is treated as final: repeating a request the receiver called
+# malformed, unauthorized or missing will not repair it, and a 409 from a webhook
+# receiver almost always means it already has this event.
+RETRYABLE_STATUSES = (
+    408,  # Request Timeout
+    425,  # Too Early
+    429,  # Too Many Requests
+)
+
+
 @dataclass(frozen=True, slots=True)
 class DeliveryResult:
     """
@@ -63,6 +93,57 @@ class DeliveryResult:
     outcome: DeliveryOutcome
     response_status: int | None = None
     error: str | None = None
+
+
+def is_retryable(result: DeliveryResult) -> bool:
+    """
+    decide whether an outcome is worth another attempt later
+    :param result: the outcome of an attempt
+    :returns: True if the same request might succeed if repeated
+    """
+    if result.outcome is DeliveryOutcome.SUCCEEDED:
+        return False
+    if result.outcome in (DeliveryOutcome.TIMEOUT, DeliveryOutcome.NETWORK_ERROR):
+        return True
+
+    # A 3xx lands here too. Redirects are not followed, and a destination that
+    # answers with one is misconfigured rather than briefly unwell, so it is
+    # final like the other non-retryable statuses.
+    status = result.response_status
+    return status is not None and (status >= 500 or status in RETRYABLE_STATUSES)
+
+
+@dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    """
+    how long to wait between attempts, and when to stop
+    """
+
+    max_attempts: int
+    initial_seconds: float
+    max_seconds: float
+
+    def delay_after(self, attempts_made: int) -> timedelta:
+        """
+        work out how long to wait before the next attempt
+        :param attempts_made: how many attempts have already been made
+        :returns: the wait before the next one becomes due
+        """
+        # Doubling from the initial delay and capped, with no jitter. Jitter would
+        # spread a thundering herd across a shared destination, but it would also
+        # make every retry test approximate, and nothing here fans out widely
+        # enough yet to need it.
+        exponent = max(attempts_made - 1, 0)
+        seconds = self.initial_seconds * (2**exponent)
+        return timedelta(seconds=min(seconds, self.max_seconds))
+
+    def is_exhausted(self, attempts_made: int) -> bool:
+        """
+        report whether a delivery has used up its allowance
+        :param attempts_made: how many attempts have already been made
+        :returns: True if no further attempt should be scheduled
+        """
+        return attempts_made >= self.max_attempts
 
 
 class WebhookUrlRejected(Exception):
@@ -153,6 +234,26 @@ def new_delivery_attempt_id() -> str:
     :returns: a fresh attempt id such as ``att_1f0c9a...``
     """
     return f"{DELIVERY_ATTEMPT_ID_PREFIX}{uuid.uuid4().hex}"
+
+
+def new_webhook_delivery_id() -> str:
+    """
+    generate an opaque identifier for a logical delivery
+    :returns: a fresh delivery id such as ``whd_1f0c9a...``
+    """
+    return f"{WEBHOOK_DELIVERY_ID_PREFIX}{uuid.uuid4().hex}"
+
+
+@dataclass(frozen=True, slots=True)
+class WebhookTarget:
+    """
+    the destination and secret a submission is owed delivery to
+    """
+
+    # Carried as a pair so that both are snapshotted together when a delivery is
+    # queued, and neither can be taken from a later version of the endpoint.
+    url: str
+    secret: str
 
 
 def build_payload(submission: Submission) -> dict[str, Any]:

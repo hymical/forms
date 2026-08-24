@@ -22,8 +22,8 @@ open-source.
 ## Project status
 
 **Early development.** This build registers endpoints, stores the submissions
-sent to them, and delivers each one once to a signed webhook. There are no
-retries yet, so delivery is best effort.
+sent to them together with the durable obligation to deliver them, and runs a
+separate worker that performs the signed webhook delivery and retries it.
 
 Endpoint and webhook configuration is completely unauthenticated: anyone who can
 reach the API can create an endpoint pointing anywhere. There is no rate limiting
@@ -37,9 +37,11 @@ and no spam protection, so do not expose this to the public internet.
 | Endpoint registry             | Implemented               |
 | Submission persistence        | Implemented               |
 | Idempotent retries            | Implemented               |
-| Signed webhook delivery       | One immediate attempt     |
+| Signed webhook delivery       | Implemented               |
+| Durable delivery queue        | Implemented               |
+| Retries with backoff          | Implemented               |
 | API keys / authentication     | **Not implemented**       |
-| Webhook retries and backoff   | **Not implemented**       |
+| Manual delivery replay        | **Not implemented**       |
 | Rate limiting, spam handling  | **Not implemented**       |
 | Schema migrations             | **Not implemented**       |
 | Export, retention, dashboards | **Not implemented**       |
@@ -79,24 +81,37 @@ See [`.env.example`](.env.example) for every setting and its default.
 
 ## Run
 
+Hymical Forms is two processes sharing one database.
+
 ```bash
 uvicorn hymical_forms.main:app --reload
 ```
+
+```bash
+python -m hymical_forms.worker
+```
+
+The **API** accepts submissions, stores them, and records that a webhook is owed.
+It never makes an outbound request. The **worker** claims owed deliveries, sends
+them, and retries the ones that fail. Running the API alone is fine: submissions
+are still accepted and nothing is lost, they simply wait until a worker exists.
 
 Missing tables are created at startup, so an empty database is enough to begin.
 Startup fails if the database cannot be reached, rather than serving requests
 that would only fail later. There is no migration framework yet, so startup
 never alters a table that already exists; see [Limitations](#limitations).
 
-> **Upgrading from an earlier build:** the schema has changed twice. The
-> `submissions` table gained `idempotency_key` and `payload_fingerprint`, the
-> `endpoints` table gained `webhook_url` and `webhook_secret`, and
-> `delivery_attempts` is new. Startup creates missing tables but never alters an
-> existing one, so a database created before these changes has to be recreated.
-> For local SQLite, delete the file and restart. For PostgreSQL,
-> `DROP TABLE delivery_attempts, submissions, endpoints;` and restart. There is
-> no in-place upgrade path, and there is no data worth keeping in a development
-> database.
+> **Upgrading from an earlier build:** the schema has changed in every release so
+> far, most recently by adding the `webhook_deliveries` table and giving
+> `delivery_attempts` a `delivery_id` and `attempt_number`. Startup creates
+> missing tables but never alters an existing one, so a database created before
+> these changes has to be recreated. For local SQLite, delete the file and
+> restart. For PostgreSQL, `DROP TABLE delivery_attempts, webhook_deliveries,
+> submissions, endpoints;` and restart. There is no in-place upgrade path.
+>
+> Three consecutive schema changes with no migration tool is the clearest
+> remaining infrastructure gap. Alembic is the next thing this project needs,
+> and it should arrive before there is a database worth not dropping.
 
 Interactive API documentation is served at `http://127.0.0.1:8000/docs`.
 
@@ -181,8 +196,8 @@ preserved in order, both in the response count and in storage. No submitted
 value is discarded.
 
 A successful request returns `202 Accepted`. The status is deliberately not
-`201`: the submission is stored, and delivering it onwards is a separate concern
-that may not have finished succeeding.
+`201`: the submission is stored and any delivery it owes is queued, but that
+delivery has not happened yet.
 
 ```json
 {
@@ -191,17 +206,16 @@ that may not have finished succeeding.
   "received_at": "2026-08-24T14:34:27.651841Z",
   "field_count": 3,
   "idempotent_replay": false,
-  "delivery": { "attempted": true, "outcome": "succeeded" }
+  "delivery": { "queued": true }
 }
 ```
 
 Submitted values are not echoed back, because the client already has them.
 
-`delivery` reports what happened to this endpoint's webhook. `attempted` is
-false when the endpoint has no webhook and on an idempotent replay, which never
-redelivers; `outcome` is null in both cases. **A failed delivery does not change
-the `202`**: the submission is already durable, and losing it because someone
-else's server was down would be the wrong trade.
+`delivery.queued` says whether a webhook delivery is owed for this submission.
+No outbound request is made during this request, so the response says nothing
+about whether a destination is reachable: that is the worker's business, and a
+destination being down can no longer affect whether a form is accepted.
 
 ### Retrying safely with `Idempotency-Key`
 
@@ -252,14 +266,24 @@ predictable key would collide with a stranger's submission. Use a random value.
 
 ### Webhook delivery
 
-If an endpoint has a `webhook_url`, each accepted submission is delivered to it
-once, immediately, as a signed JSON POST.
+If an endpoint has a `webhook_url`, accepting a submission also writes a durable
+delivery record in the **same transaction**. Nothing is sent during the form
+request. A worker picks the delivery up, sends it, and retries it if it fails.
 
-**One attempt, no retries.** A submission gets exactly one delivery attempt.
-There is no retry schedule, no backoff, no queue and no dead-letter handling, so
-a destination that is down when a form is submitted misses that submission. The
-submission itself is still stored. Retries are the next thing this layer needs,
-and until they exist, delivery is best effort.
+That transaction is the whole reliability claim. Once `POST /f/{endpoint_id}`
+answers `202`, the submission is stored *and* the obligation to deliver it is
+stored. A crash at any point after that cannot lose the delivery, because it is
+a row rather than a thing the API process was about to do.
+
+The submission response reports only whether work was queued:
+
+```json
+"delivery": { "queued": true }
+```
+
+`queued` is false when the endpoint has no webhook. An idempotent replay reports
+`true` and does **not** queue a second delivery: one submission owes at most one
+delivery, enforced by a unique constraint on the submission.
 
 #### Payload
 
@@ -284,7 +308,8 @@ signing secret is never part of the payload.
 
 #### Verifying the signature
 
-Each request carries a `Hymical-Signature` header:
+Signing is unchanged from the previous release. Each request carries a
+`Hymical-Signature` header:
 
 ```
 Hymical-Signature: v1=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
@@ -311,34 +336,77 @@ Use a constant-time comparison, as `hmac.compare_digest` does above. The `v1=`
 prefix exists so a future scheme can be added without breaking receivers that
 only understand this one.
 
-There is no timestamp in the signature. To guard against replay, use the
-`id` and `received_at` inside the signed payload: submission IDs are unique, so
-ignoring one you have already processed is both replay protection and protection
-against a future retry delivering twice.
+A delivery keeps the destination and secret that were configured when the
+submission was accepted. Changing an endpoint's webhook does not redirect
+deliveries that are already queued, and does not leave a queued payload signed
+with a secret its receiver never had.
 
-#### What counts as success
+#### Delivery states
 
-| Outcome         | Meaning                                                    |
-| --------------- | ---------------------------------------------------------- |
-| `succeeded`     | The destination answered `2xx`                              |
-| `http_error`    | The destination answered anything else, including `3xx`     |
-| `timeout`       | The destination did not connect or answer in time           |
-| `network_error` | The connection could not be made at all                     |
+| State        | Meaning                                                 |
+| ------------ | ------------------------------------------------------- |
+| `pending`    | Owed, waiting for its next attempt time                  |
+| `processing` | Claimed by a worker, holding a lease                     |
+| `delivered`  | A destination answered `2xx`. Terminal                   |
+| `failed`     | Given up on. Terminal                                    |
 
-**Redirects are not followed.** A `3xx` is recorded as `http_error`. Following
-redirects would let a destination bounce the request to an address that URL
-validation refused, which is the usual way SSRF protection gets walked around.
+#### What retries, and what does not
 
-Timeouts default to 5 seconds to connect and 10 seconds to respond, both
-configurable. A slow destination cannot stall form ingestion beyond that.
+| Outcome                            | Retried |
+| ---------------------------------- | ------- |
+| Connection failure                  | yes     |
+| Timeout                             | yes     |
+| HTTP `5xx`                          | yes     |
+| HTTP `408`, `425`, `429`            | yes     |
+| HTTP `2xx`                          | delivered |
+| Any other `4xx`, including `409`    | no      |
+| `3xx`                               | no      |
+
+Ordinary `4xx` responses are final because repeating a request the receiver
+called malformed, unauthorized or missing will not repair it. `409` is treated
+as final too: from a webhook receiver it almost always means "I already have
+this event". Redirects are still not followed, and a `3xx` is a misconfiguration
+rather than a passing problem, so it is final as well.
+
+#### Retry schedule
+
+Delivery is attempted immediately, then backs off by doubling, capped:
+
+| Attempt | Waits before it |
+| ------- | --------------- |
+| 1       | none            |
+| 2       | 10s             |
+| 3       | 20s             |
+| 4       | 40s             |
+| 5       | 80s             |
+
+After `FORMS_WEBHOOK_MAX_ATTEMPTS` (default 5) the delivery becomes `failed` and
+is never retried. There is no jitter: the schedule is deliberately exactly
+predictable. Every attempt, including the last, stays in `delivery_attempts`.
+
+#### At-least-once, not exactly-once
+
+A worker claims a delivery by taking a lease on it. If the worker dies, the
+lease expires and another worker picks the delivery up, which is what stops a
+crash from stranding work in `processing` forever.
+
+**This means duplicate delivery is possible.** A worker that sends successfully
+and then dies before recording that success leaves a delivery that looks unsent,
+and the next worker sends it again. No queue can close this window on its own;
+it needs the receiver's cooperation. Use the `id` in the signed payload to
+ignore an event you have already processed. Hymical Forms does not offer
+exactly-once delivery and there is no message broker involved: PostgreSQL is
+the queue.
 
 #### What is recorded
 
-Every attempt writes a row to `delivery_attempts`: the attempt ID, the
-submission, the URL used, the timestamp, the outcome, the HTTP status when there
-was one, and a bounded failure message. Response bodies are **not** stored, and
-neither is the signing secret. There is no API to read these back yet; query the
-table directly.
+`webhook_deliveries` holds one row per logical delivery: its state, how many
+attempts it has had, when it is next due, and when it finished.
+`delivery_attempts` holds one row per request that actually went out, numbered,
+with the outcome, the HTTP status when there was one, and a bounded failure
+message. Response bodies are **not** stored, and neither is the signing secret.
+A job that is inspected and found not due records nothing. There is no API to
+read either table yet; query them directly.
 
 #### Destinations that are refused
 
@@ -436,6 +504,12 @@ All settings are read from `FORMS_`-prefixed environment variables, or from a
 | `FORMS_WEBHOOK_CONNECT_TIMEOUT_SECONDS` | `5`  | Wait for a webhook to accept a connection |
 | `FORMS_WEBHOOK_READ_TIMEOUT_SECONDS`    | `10` | Wait for a webhook to respond             |
 | `FORMS_ALLOW_PRIVATE_WEBHOOK_TARGETS`   | `false` | Permit loopback and private webhook targets. Development only |
+| `FORMS_WEBHOOK_MAX_ATTEMPTS`            | `5`     | Attempts before a delivery is given up on |
+| `FORMS_WEBHOOK_RETRY_INITIAL_SECONDS`   | `10`    | Wait before the second attempt; later waits double |
+| `FORMS_WEBHOOK_RETRY_MAX_SECONDS`       | `3600`  | Cap on the wait between attempts           |
+| `FORMS_WORKER_POLL_SECONDS`             | `1`     | How often an idle worker looks for work    |
+| `FORMS_WORKER_BATCH_SIZE`               | `10`    | Deliveries a worker claims at once         |
+| `FORMS_WORKER_LEASE_SECONDS`            | `60`    | How long a worker's claim holds            |
 
 ## Development
 
@@ -457,12 +531,13 @@ src/hymical_forms/
   config.py         typed settings
   db.py             engine, session, and schema lifecycle
   errors.py         the shared JSON error envelope
-  delivery.py       the single outbound webhook attempt
+  delivery.py       the outbound webhook request itself
   ingestion.py      domain rules: endpoint IDs, submission validation
   middleware.py     request body size limit
   models.py         the persisted schema
   storage.py        queries and writes
-  webhooks.py       webhook rules: URL validation, payload, signature
+  webhooks.py       webhook rules: URL validation, payload, signature, retry policy
+  worker.py         the delivery worker process
   main.py           ASGI entrypoint
   api/              HTTP routes and response models
 ```
@@ -471,7 +546,8 @@ src/hymical_forms/
 HTTP or the database. `models.py` and `storage.py` are the only modules that
 write queries, and `delivery.py` is the only one that makes an outbound request.
 `api/` translates requests into domain rules and storage calls, and their
-outcomes into responses.
+outcomes into responses. `worker.py` is a separate process and shares only the
+database with the API.
 
 ### Storage notes
 
@@ -493,24 +569,41 @@ an optimisation for the common retry; when two requests race, one insert loses
 on the constraint, rolls back and reads the winner's row. A `CHECK` constraint
 keeps the key and its fingerprint either both set or both absent.
 
-Webhook delivery is deliberately outside the submission's transaction. The
-submission is committed first, then the network call is made with no transaction
-held, then the attempt is recorded in a transaction of its own. Holding a
-database transaction open across a call to somebody else's server would tie the
+A submission and the delivery it owes are written in one transaction. Either
+both land or neither does, so there is no state in which a form was accepted but
+the promise to deliver it went missing, and none in which delivery work exists
+for a submission that does not.
+
+The network call happens later, in the worker, with no transaction open. Holding
+a database transaction across a call to somebody else's server would tie the
 connection pool to how fast that server answers.
 
-That ordering has one consequence worth naming: if recording the attempt fails
-after the webhook has already been sent, the request still returns `202`. The
-submission is durable and the delivery did happen, so reporting failure would be
-untrue and would invite a retry that delivers a second time. The lost record is
-logged for an operator.
+Workers claim deliveries with `SELECT ... FOR UPDATE SKIP LOCKED` on PostgreSQL,
+so two workers scanning at once are handed different rows rather than fighting
+over the same one. SQLite has no such locking and silently ignores `FOR UPDATE`,
+so the claim also performs a conditional update and treats a row as claimed only
+if that update matched. That guard is redundant under `SKIP LOCKED` and is what
+makes the claim safe on SQLite.
 
 ## Limitations
 
-- **No webhook retries.** Each submission gets exactly one delivery attempt. If
-  it fails, nothing re-sends it and there is no way to replay it. If the process
-  dies between committing a submission and delivering it, that delivery never
-  happens. Delivery is best effort until retries exist.
+- **Delivery is at-least-once, never exactly-once.** A worker that delivers
+  successfully and dies before recording it will have its lease expire, and the
+  next worker will deliver the same event again. Deduplicate on the submission
+  `id` in the signed payload.
+- **PostgreSQL worker concurrency is not exercised by the test suite.** Tests run
+  on SQLite, which cannot model `SELECT ... FOR UPDATE SKIP LOCKED`. The
+  generated PostgreSQL SQL is asserted, and the claim is written so that it is
+  also correct without row locking, but two real workers racing on PostgreSQL has
+  not been run. A PostgreSQL service in CI is the way to close this.
+- **A failed delivery is final and cannot be replayed.** Once a delivery reaches
+  `failed`, nothing retries it and there is no manual replay route.
+- **The lease must outlast a delivery attempt.** A batch is delivered
+  concurrently, so it takes about as long as its slowest single delivery rather
+  than the sum, but if `FORMS_WORKER_LEASE_SECONDS` were set below the connect
+  and read timeouts combined, another worker could claim a delivery that is still
+  in flight and send it twice. The defaults leave a wide margin; keep it that way
+  if you change them.
 - **SSRF protection is partial.** Destination URLs are checked for scheme and for
   literal internal addresses, and redirects are not followed. Hostnames are
   **not** resolved, so a name that resolves to a private address still passes,

@@ -4,25 +4,20 @@ form ingestion endpoint: ``POST /f/{endpoint_id}``
 
 from __future__ import annotations
 
-import logging
 import math
 from datetime import datetime
 from http import HTTPStatus
 
-import httpx2
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 from python_multipart.exceptions import ParseError
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.formparsers import FormParser, MultiPartException, MultiPartParser
 
-from hymical_forms import storage, webhooks
+from hymical_forms import storage
 from hymical_forms.config import Settings
 from hymical_forms.db import SessionDep
-from hymical_forms.delivery import deliver
 from hymical_forms.errors import ApiError, ErrorResponse
 from hymical_forms.ingestion import (
     ENDPOINT_ID_RULE,
@@ -32,9 +27,7 @@ from hymical_forms.ingestion import (
     is_valid_idempotency_key,
     payload_fingerprint,
 )
-from hymical_forms.webhooks import DeliveryOutcome, DeliveryResult
-
-logger = logging.getLogger(__name__)
+from hymical_forms.webhooks import WebhookTarget
 
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 
@@ -208,18 +201,16 @@ class FileUploadNotSupported(ApiError):
 
 class DeliveryStatus(BaseModel):
     """
-    what happened to the webhook for this submission, if anything
+    whether this submission owes a webhook delivery
     """
 
-    attempted: bool = Field(
+    queued: bool = Field(
         description=(
-            "Whether a webhook delivery was attempted for this request. False when the "
-            "endpoint has no webhook, and false on an idempotent replay, which never "
-            "redelivers."
+            "True when a durable webhook delivery exists for this submission. False "
+            "when the endpoint has no webhook. A delivery is queued once and is not "
+            "queued again by an idempotent replay, so a replay of a webhook-enabled "
+            "submission still reports true."
         )
-    )
-    outcome: DeliveryOutcome | None = Field(
-        description="Result of the attempt, or null when none was made."
     )
 
 
@@ -242,7 +233,7 @@ class SubmissionAccepted(BaseModel):
         ),
     )
     delivery: DeliveryStatus = Field(
-        description="What happened to this endpoint's webhook, if it has one."
+        description="Whether a webhook delivery is owed for this submission."
     )
 
 
@@ -309,94 +300,46 @@ async def submit(endpoint_id: str, request: Request, session: SessionDep) -> Sub
         max_field_value_length=settings.max_field_value_length,
     )
 
+    # The submission and, if the endpoint has a webhook, the durable obligation to
+    # deliver it are committed together. Nothing outbound happens here: once this
+    # returns, a worker owns the delivery, and a crash in this process can no
+    # longer lose a delivery that was implicitly promised by a 202.
+    #
     # The commit happens inside the handler, not in the session dependency's
     # teardown, so that a failure still becomes an error response. Teardown runs
     # after the response has been sent, where raising could no longer change it.
+    webhook = (
+        WebhookTarget(url=webhook_url, secret=webhook_secret)
+        if webhook_url is not None and webhook_secret is not None
+        else None
+    )
     try:
         stored = await run_in_threadpool(
             storage.store_submission,
             session,
             submission,
+            now=submission.received_at,
             idempotency_key=idempotency_key,
             payload_fingerprint=(
                 payload_fingerprint(submission.fields) if idempotency_key else None
             ),
+            webhook=webhook,
         )
     except storage.IdempotencyKeyReused as exc:
         raise IdempotencyConflict(exc.endpoint_id, exc.idempotency_key) from exc
 
-    # The submission is durable from here on. Everything below is downstream
-    # delivery, and none of it may turn an accepted submission into a failure.
-    delivery = await _deliver(request, session, stored, webhook_url, webhook_secret)
-
     # A replay answers with the original submission's identity and timestamp, so
     # a client that retried after a lost response ends up describing one event.
+    # It reports the same queued state as the original, because the delivery that
+    # request created is still the one that is owed.
     return SubmissionAccepted(
         submission_id=stored.submission.id,
         endpoint_id=stored.submission.endpoint_id,
         received_at=stored.submission.received_at,
         field_count=stored.submission.field_count,
         idempotent_replay=stored.replayed,
-        delivery=delivery,
+        delivery=DeliveryStatus(queued=webhook is not None),
     )
-
-
-async def _deliver(
-    request: Request,
-    session: Session,
-    stored: storage.StoredSubmission,
-    webhook_url: str | None,
-    webhook_secret: str | None,
-) -> DeliveryStatus:
-    """
-    make the one delivery attempt this submission is owed, if it is owed one
-    :param request: the incoming request, read for the shared outbound client
-    :param session: the session to record the attempt through
-    :param stored: the submission as it was stored, and whether it was a replay
-    :param webhook_url: the endpoint's destination, or None if it has no webhook
-    :param webhook_secret: the destination's signing secret
-    :returns: what the caller should be told about delivery
-    """
-    # A replay is a client retrying a request whose submission already exists,
-    # and that submission already had its attempt. Delivering again would turn a
-    # lost response into duplicate downstream processing, which is the exact
-    # problem the idempotency key was introduced to solve.
-    if webhook_url is None or webhook_secret is None or stored.replayed:
-        return DeliveryStatus(attempted=False, outcome=None)
-
-    client: httpx2.AsyncClient = request.app.state.webhook_client
-    body = webhooks.serialize_payload(webhooks.build_payload(stored.submission))
-    result = await deliver(client, url=webhook_url, secret=webhook_secret, body=body)
-
-    await run_in_threadpool(_record_attempt, session, stored.submission.id, webhook_url, result)
-    return DeliveryStatus(attempted=True, outcome=result.outcome)
-
-
-def _record_attempt(
-    session: Session, submission_id: str, destination_url: str, result: DeliveryResult
-) -> None:
-    """
-    write the delivery attempt, without letting a bookkeeping failure escape
-    :param session: the session to write through
-    :param submission_id: the submission the attempt was delivering
-    :param destination_url: the URL the attempt was sent to
-    :param result: the outcome of the attempt
-    """
-    try:
-        storage.record_delivery_attempt(
-            session,
-            submission_id=submission_id,
-            destination_url=destination_url,
-            result=result,
-        )
-    except SQLAlchemyError:
-        # By now the submission is durable and the webhook has already been sent.
-        # Answering with an error would tell the client its form was lost, which
-        # is untrue, and would invite a retry that delivers a second time. Losing
-        # the record costs observability, not correctness, so it is logged for an
-        # operator and the request still succeeds.
-        session.rollback()
-        logger.exception("could not record webhook delivery attempt for %s", submission_id)
 
 
 def _idempotency_key(request: Request) -> str | None:

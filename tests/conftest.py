@@ -9,9 +9,11 @@ SQLite database, which starts empty and disappears when the test ends.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
@@ -22,6 +24,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from hymical_forms.app import create_app
 from hymical_forms.config import Settings
+from hymical_forms.delivery import create_webhook_client
+from hymical_forms.worker import process_batch
 from webhook_server import WebhookRecorder
 
 URLENCODED_HEADERS = {"content-type": "application/x-www-form-urlencoded"}
@@ -87,6 +91,38 @@ def create_endpoint(
     response = client.post("/endpoints", json=body)
     assert response.status_code == 201, response.text
     return cast(dict[str, Any], response.json())
+
+
+def app_settings(client: TestClient) -> Settings:
+    """
+    read the settings the client's application was built with
+    :param client: the client whose application should be inspected
+    :returns: that application's settings
+    """
+    return cast(Settings, cast(FastAPI, client.app).state.settings)
+
+
+def work_once(client: TestClient, *, now: datetime | None = None) -> int:
+    """
+    run one worker batch against the client's database, as a separate worker would
+    :param client: the client whose application database holds the delivery queue
+    :param now: the instant the worker should treat as current, defaulting to real time
+    :returns: how many deliveries were attempted
+    """
+    # Deliberately not started through the API process. The worker gets its own
+    # session and its own outbound client, the way a separate process would.
+    settings = app_settings(client)
+    moment = now if now is not None else datetime.now(UTC)
+
+    async def run() -> int:
+        webhook_client = create_webhook_client(settings)
+        try:
+            with open_session(client) as session:
+                return await process_batch(session, webhook_client, settings, now=moment)
+        finally:
+            await webhook_client.aclose()
+
+    return asyncio.run(run())
 
 
 def open_session(client: TestClient) -> Session:

@@ -10,6 +10,8 @@ from __future__ import annotations
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from hymical_forms.webhooks import RetryPolicy
+
 
 class Settings(BaseSettings):
     """
@@ -60,6 +62,40 @@ class Settings(BaseSettings):
         gt=0,
         description="How long to wait for a webhook destination to respond.",
     )
+    webhook_max_attempts: int = Field(
+        default=5,
+        ge=1,
+        description="How many delivery attempts a submission gets before it is given up on.",
+    )
+    webhook_retry_initial_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        description="Wait before the second attempt. Each later wait doubles it.",
+    )
+    webhook_retry_max_seconds: float = Field(
+        default=3600.0,
+        gt=0,
+        description="Cap on the wait between attempts, however far the backoff has doubled.",
+    )
+    worker_poll_seconds: float = Field(
+        default=1.0,
+        gt=0,
+        description="How long the worker waits before looking for due deliveries again.",
+    )
+    worker_batch_size: int = Field(
+        default=10,
+        ge=1,
+        description="How many deliveries a worker claims at once.",
+    )
+    worker_lease_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description=(
+            "How long a worker's claim on a delivery holds. After this the delivery "
+            "becomes claimable again, which is how work is recovered from a worker "
+            "that died holding it."
+        ),
+    )
     allow_private_webhook_targets: bool = Field(
         default=False,
         description=(
@@ -68,3 +104,14 @@ class Settings(BaseSettings):
             "exposes the server to SSRF."
         ),
     )
+
+    def retry_policy(self) -> RetryPolicy:
+        """
+        gather the retry settings into the value the delivery code works with
+        :returns: the configured retry policy
+        """
+        return RetryPolicy(
+            max_attempts=self.webhook_max_attempts,
+            initial_seconds=self.webhook_retry_initial_seconds,
+            max_seconds=self.webhook_retry_max_seconds,
+        )

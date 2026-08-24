@@ -28,8 +28,11 @@ from hymical_forms.ingestion import Submission as DomainSubmission
 from hymical_forms.webhooks import (
     DELIVERY_ATTEMPT_ID_MAX_LENGTH,
     DELIVERY_ERROR_MAX_LENGTH,
+    DELIVERY_STATE_MAX_LENGTH,
+    WEBHOOK_DELIVERY_ID_MAX_LENGTH,
     WEBHOOK_SECRET_MAX_LENGTH,
     WEBHOOK_URL_MAX_LENGTH,
+    DeliveryState,
 )
 
 ENDPOINT_NAME_MAX_LENGTH = 200
@@ -216,19 +219,82 @@ class Submission(Base):
         )
 
 
-class DeliveryAttempt(Base):
+class WebhookDelivery(Base):
     """
-    a record of one attempt to deliver a submission to its webhook
+    the durable obligation to deliver one submission to one destination
     """
 
+    # This is the outbox. It is written in the same transaction as the submission
+    # it belongs to, so a submission can never be acknowledged while the promise
+    # to deliver it quietly goes missing.
+    __tablename__ = "webhook_deliveries"
+
+    __table_args__ = (
+        # One logical delivery per submission. An idempotent replay resolves to an
+        # existing submission, so this constraint is what makes "a replay never
+        # queues a second delivery" a property of the database rather than of the
+        # code path that happens to run.
+        UniqueConstraint("submission_id", name="uq_webhook_deliveries_submission"),
+        # A delivery is finished exactly when it says it is finished.
+        CheckConstraint(
+            "(state IN ('delivered', 'failed')) = (completed_at IS NOT NULL)",
+            name="ck_webhook_deliveries_completion",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(WEBHOOK_DELIVERY_ID_MAX_LENGTH), primary_key=True)
+    submission_id: Mapped[str] = mapped_column(
+        String(SUBMISSION_ID_MAX_LENGTH), ForeignKey("submissions.id")
+    )
+
+    # The destination and secret are snapshotted, not read through to the
+    # endpoint. A delivery represents what was owed when the submission was
+    # accepted, so changing an endpoint's webhook later must not silently
+    # redirect work that is already queued, nor leave a queued payload signed
+    # with a secret its receiver never had.
+    destination_url: Mapped[str] = mapped_column(String(WEBHOOK_URL_MAX_LENGTH))
+    signing_secret: Mapped[str] = mapped_column(String(WEBHOOK_SECRET_MAX_LENGTH))
+
+    state: Mapped[str] = mapped_column(
+        String(DELIVERY_STATE_MAX_LENGTH), default=DeliveryState.PENDING
+    )
+    attempts: Mapped[int] = mapped_column(default=0)
+
+    # When this delivery next becomes due. Indexed with the state because that
+    # pair is exactly what a worker scans for on every poll.
+    next_attempt_at: Mapped[datetime] = mapped_column(UtcDateTime, index=True)
+
+    # Set while a worker holds the job. A lease that has run out makes the job
+    # claimable again, which is what stops a worker that died mid-delivery from
+    # leaving a permanent ``processing`` tombstone.
+    claim_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime, default=None)
+
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, default=None)
+
+
+class DeliveryAttempt(Base):
+    """
+    a record of one outbound request actually made for a delivery
+    """
+
+    # The audit trail. One row per request that genuinely went out, so a delivery
+    # that was retried four times has four rows and none of them is overwritten.
+    # A job that is merely inspected and found not due produces nothing here.
     __tablename__ = "delivery_attempts"
 
     id: Mapped[str] = mapped_column(String(DELIVERY_ATTEMPT_ID_MAX_LENGTH), primary_key=True)
+    delivery_id: Mapped[str] = mapped_column(
+        String(WEBHOOK_DELIVERY_ID_MAX_LENGTH),
+        ForeignKey("webhook_deliveries.id"),
+        index=True,
+    )
     submission_id: Mapped[str] = mapped_column(
         String(SUBMISSION_ID_MAX_LENGTH),
         ForeignKey("submissions.id"),
         index=True,
     )
+    attempt_number: Mapped[int] = mapped_column()
 
     # The URL as it was used, not as it is configured now, so the record still
     # explains itself after the endpoint's destination changes.
