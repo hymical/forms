@@ -8,6 +8,23 @@
   Reliable form ingestion and webhook delivery for developers.
 </p>
 
+<p align="center">
+  <a href="https://github.com/hymical/forms/actions">
+    <img src="https://github.com/hymical/forms/actions/workflows/ci.yml/badge.svg"
+         alt="CI">
+  </a>
+  <img src="https://img.shields.io/badge/python-3.11%2B-blue"
+       alt="Python 3.11+">
+  <a href="https://github.com/hymical/forms/blob/main/LICENSE">
+    <img src="https://img.shields.io/badge/license-Apache%202.0-blue"
+         alt="Apache License 2.0">
+  </a>
+  <img src="https://img.shields.io/badge/FastAPI-0.141%2B-009688"
+       alt="FastAPI">
+  <img src="https://img.shields.io/badge/PostgreSQL-production%20database-4169E1"
+       alt="PostgreSQL">
+</p>
+
 ## The problem
 
 Every project with a contact form, a waitlist, or a feedback box ends up needing
