@@ -35,6 +35,7 @@ not expose this to the public internet.
 | Request limits + error model  | Implemented               |
 | Endpoint registry             | Implemented               |
 | Submission persistence        | Implemented               |
+| Idempotent retries            | Implemented               |
 | API keys / authentication     | **Not implemented**       |
 | Webhook delivery and retries  | **Not implemented**       |
 | Rate limiting, spam handling  | **Not implemented**       |
@@ -84,6 +85,14 @@ Missing tables are created at startup, so an empty database is enough to begin.
 Startup fails if the database cannot be reached, rather than serving requests
 that would only fail later. There is no migration framework yet, so startup
 never alters a table that already exists; see [Limitations](#limitations).
+
+> **Upgrading from an earlier build:** the `submissions` table gained the
+> `idempotency_key` and `payload_fingerprint` columns along with the constraints
+> that enforce them. Startup will not add them to a table that already exists, so
+> a database created before idempotency has to be recreated. For local SQLite,
+> delete the file and restart. For PostgreSQL, `DROP TABLE submissions, endpoints;`
+> and restart. There is no in-place upgrade path, and there is no data worth
+> keeping in a development database.
 
 Interactive API documentation is served at `http://127.0.0.1:8000/docs`.
 
@@ -167,11 +176,59 @@ happened yet.
   "submission_id": "sub_48984534f33749c49a88de2d59400dce",
   "endpoint_id": "contact-form",
   "received_at": "2026-08-24T14:34:27.651841Z",
-  "field_count": 3
+  "field_count": 3,
+  "idempotent_replay": false
 }
 ```
 
 Submitted values are not echoed back, because the client already has them.
+
+### Retrying safely with `Idempotency-Key`
+
+A client that never sees a response cannot tell whether the submission landed.
+Send an `Idempotency-Key` header and the retry becomes safe: the second request
+returns the result of the first instead of storing the form twice.
+
+```bash
+KEY=$(uuidgen)
+curl -i -X POST http://127.0.0.1:8000/f/contact-form \
+  -H "Idempotency-Key: $KEY" \
+  -d email=dev@example.com -d message=hello
+```
+
+The header is optional. Without it, behaviour is unchanged and every accepted
+request stores a new submission.
+
+**Retry semantics.** Repeating the same key on the same endpoint with the same
+content returns `202` with the *original* `submission_id` and `received_at`, and
+`"idempotent_replay": true`. Only one row is ever stored, and this holds even
+when the retries arrive at the same instant: the database, not the application,
+is what decides the winner.
+
+The server does not retry anything on your behalf. It only makes your retries
+safe.
+
+**Conflict semantics.** Reusing a key on the same endpoint with *different*
+content is rejected with `409 idempotency_conflict`. The stored submission is
+left exactly as it was, and the response never describes its contents.
+
+Content is compared by a SHA-256 fingerprint of the normalized fields. Because
+field order and repeated values are meaningful to this service, they are
+meaningful to the fingerprint too: `a=1&b=2` and `b=2&a=1` are different
+payloads and will conflict. The generated submission ID and the received
+timestamp are excluded, so an honest retry always matches.
+
+**Scope.** A key belongs to one endpoint. The same key may be used once per
+endpoint without conflicting, and there is no expiry: a key is spent for as long
+as its submission is stored.
+
+**Key format.** 16 to 255 printable ASCII characters with no spaces, which
+accepts UUIDs, hex, base64 and base64url. Anything else is rejected with
+`400 invalid_idempotency_key`, including a header that is present but empty.
+
+The 16-character floor exists because keys are endpoint-scoped and this API is
+unauthenticated, so every client of an endpoint shares one key space. A short or
+predictable key would collide with a stranger's submission. Use a random value.
 
 ### Try it
 
@@ -214,12 +271,14 @@ add.
 | Status | `code`                     | Cause                                                    |
 | ------ | -------------------------- | -------------------------------------------------------- |
 | 400    | `malformed_form_body`      | Body does not parse as the declared content type          |
+| 400    | `invalid_idempotency_key`  | `Idempotency-Key` header breaks the key format rules      |
 | 404    | `invalid_endpoint_id`      | Submission path is not a well-formed endpoint ID          |
 | 404    | `endpoint_not_found`       | Endpoint ID is well formed but no such endpoint exists    |
 | 404    | `not_found`                | Unknown path                                              |
 | 405    | `method_not_allowed`       | Wrong method for a known path                             |
 | 409    | `endpoint_inactive`        | Endpoint exists but is not accepting submissions          |
 | 409    | `endpoint_already_exists`  | Endpoint ID is already taken                              |
+| 409    | `idempotency_conflict`     | Idempotency key already used for different content        |
 | 413    | `request_body_too_large`   | Body exceeded `FORMS_MAX_BODY_BYTES`                      |
 | 415    | `unsupported_media_type`   | Content type is not a supported form encoding             |
 | 422    | `empty_submission`         | No fields were submitted                                  |
@@ -290,8 +349,18 @@ list of values submitted under it, which is how repeated names survive intact.
 On PostgreSQL the column is `json` rather than `jsonb`, because `jsonb`
 normalises object key order and would silently reorder a form's fields.
 
-Each request runs in one transaction, committed explicitly by the route handler.
-A failure anywhere before that commit leaves the database untouched.
+Each request runs in one transaction, committed explicitly rather than in the
+session teardown, so a failure becomes an error response instead of a success
+for a row that never landed. A failure anywhere before the commit leaves the
+database untouched.
+
+An idempotency key is unique per endpoint through a database constraint on
+`(endpoint_id, idempotency_key)`. Both PostgreSQL and SQLite treat NULLs in a
+unique constraint as distinct, so submissions sent without a key stay
+unrestricted without needing a partial index. A lookup before inserting is only
+an optimisation for the common retry; when two requests race, one insert loses
+on the constraint, rolls back and reads the winner's row. A `CHECK` constraint
+keeps the key and its fingerprint either both set or both absent.
 
 ## Limitations
 
@@ -310,6 +379,16 @@ A failure anywhere before that commit leaves the database untouched.
   `FORMS_MAX_BODY_BYTES`.
 - A rejected submission reveals whether an endpoint ID exists, which allows
   enumeration. This is unavoidable while the API is unauthenticated.
+- **Idempotency keys never expire.** A key stays spent for as long as its
+  submission is stored, so the table only grows. Expiry belongs with retention.
+- **Idempotency keys are shared across all clients of an endpoint,** because
+  there is nothing to scope them to yet. Guessing another client's key returns
+  that submission's ID and timestamp, though never its contents. Random keys of
+  the required length make this impractical, and API keys will close it properly.
+- **A replay is only recognised once the first attempt has committed.** A retry
+  sent while the original is still in flight is treated as a concurrent request,
+  which is safe, but a retry sent after the original *failed* is a new
+  submission, which is correct.
 - Submission IDs are opaque and not yet guaranteed stable in format.
 
 ## License

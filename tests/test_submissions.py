@@ -118,4 +118,5 @@ def test_does_not_echo_submitted_values(client: TestClient) -> None:
         "endpoint_id",
         "received_at",
         "field_count",
+        "idempotent_replay",
     }

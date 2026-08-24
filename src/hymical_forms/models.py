@@ -6,11 +6,24 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, String, TypeDecorator
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    String,
+    TypeDecorator,
+    UniqueConstraint,
+)
 from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from hymical_forms.ingestion import ENDPOINT_ID_MAX_LENGTH, SUBMISSION_ID_MAX_LENGTH
+from hymical_forms.ingestion import (
+    ENDPOINT_ID_MAX_LENGTH,
+    IDEMPOTENCY_KEY_MAX_LENGTH,
+    PAYLOAD_FINGERPRINT_LENGTH,
+    SUBMISSION_ID_MAX_LENGTH,
+)
 from hymical_forms.ingestion import Submission as DomainSubmission
 
 ENDPOINT_NAME_MAX_LENGTH = 200
@@ -94,6 +107,26 @@ class Submission(Base):
 
     __tablename__ = "submissions"
 
+    __table_args__ = (
+        # The database, not the application, is what makes an idempotency key
+        # unique per endpoint. Two concurrent retries can both find nothing and
+        # both try to insert, so the constraint is the only authoritative answer.
+        #
+        # Both PostgreSQL and SQLite treat NULLs in a unique constraint as
+        # distinct from each other, so submissions sent without a key stay
+        # unrestricted without needing a partial index on either backend.
+        UniqueConstraint(
+            "endpoint_id",
+            "idempotency_key",
+            name="uq_submissions_endpoint_idempotency_key",
+        ),
+        # A submission either carries a full idempotency identity or none of it.
+        CheckConstraint(
+            "(idempotency_key IS NULL) = (payload_fingerprint IS NULL)",
+            name="ck_submissions_idempotency_identity",
+        ),
+    )
+
     id: Mapped[str] = mapped_column(String(SUBMISSION_ID_MAX_LENGTH), primary_key=True)
     endpoint_id: Mapped[str] = mapped_column(
         String(ENDPOINT_ID_MAX_LENGTH),
@@ -111,11 +144,29 @@ class Submission(Base):
     # :meth:`to_domain`.
     fields: Mapped[dict[str, list[str]]] = mapped_column(JSON)
 
+    # Null for submissions sent without an ``Idempotency-Key``, which is the
+    # common case. When present, the fingerprint is what tells a safe retry apart
+    # from the same key being reused for different content.
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(IDEMPOTENCY_KEY_MAX_LENGTH), default=None
+    )
+    payload_fingerprint: Mapped[str | None] = mapped_column(
+        String(PAYLOAD_FINGERPRINT_LENGTH), default=None
+    )
+
     @classmethod
-    def from_domain(cls, submission: DomainSubmission) -> Submission:
+    def from_domain(
+        cls,
+        submission: DomainSubmission,
+        *,
+        idempotency_key: str | None = None,
+        payload_fingerprint: str | None = None,
+    ) -> Submission:
         """
         build a persistable row from a validated domain submission
         :param submission: the normalized submission to store
+        :param idempotency_key: the client's retry key, or None if it sent none
+        :param payload_fingerprint: digest of the submitted content, set only alongside a key
         :returns: an unsaved row mirroring the submission
         """
         return cls(
@@ -123,6 +174,8 @@ class Submission(Base):
             endpoint_id=submission.endpoint_id,
             received_at=submission.received_at,
             fields={name: list(values) for name, values in submission.fields.items()},
+            idempotency_key=idempotency_key,
+            payload_fingerprint=payload_fingerprint,
         )
 
     def to_domain(self) -> DomainSubmission:

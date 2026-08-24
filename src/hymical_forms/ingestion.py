@@ -9,9 +9,11 @@ the API layer.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -37,6 +39,61 @@ ENDPOINT_ID_RULE = (
     f"Endpoint IDs are {ENDPOINT_ID_MIN_LENGTH}-{ENDPOINT_ID_MAX_LENGTH} characters using "
     "lowercase letters, digits, '-' and '_', and must start and end with a letter or digit."
 )
+
+# An idempotency key is scoped to one endpoint, and this API is unauthenticated,
+# so every client of an endpoint draws from the same key space. A short or
+# predictable key would therefore collide with a stranger's submission, which is
+# why the floor is high enough to force a random token rather than a counter.
+IDEMPOTENCY_KEY_MIN_LENGTH = 16
+IDEMPOTENCY_KEY_MAX_LENGTH = 255
+
+# Printable ASCII with no spaces: covers UUIDs, hex, base64 and base64url, and
+# keeps unbounded or unprintable header content out of the database.
+_IDEMPOTENCY_KEY_PATTERN = re.compile(r"[!-~]+")
+
+IDEMPOTENCY_KEY_RULE = (
+    f"Idempotency keys are {IDEMPOTENCY_KEY_MIN_LENGTH}-{IDEMPOTENCY_KEY_MAX_LENGTH} printable "
+    "ASCII characters with no spaces. Use a random value such as a UUID."
+)
+
+# A SHA-256 digest rendered as hex.
+PAYLOAD_FINGERPRINT_LENGTH = 64
+
+
+def is_valid_idempotency_key(value: str) -> bool:
+    """
+    report whether a header value is a usable idempotency key
+    :param value: the raw ``Idempotency-Key`` header value
+    :returns: True if the key is well formed
+    """
+    return (
+        IDEMPOTENCY_KEY_MIN_LENGTH <= len(value) <= IDEMPOTENCY_KEY_MAX_LENGTH
+        and _IDEMPOTENCY_KEY_PATTERN.fullmatch(value) is not None
+    )
+
+
+def payload_fingerprint(fields: Mapping[str, tuple[str, ...]]) -> str:
+    """
+    digest the submitted content so a retry can be recognised as the same request
+    :param fields: the normalized fields of a submission
+    :returns: a hex SHA-256 digest of the field content
+    """
+    # Only the fields are hashed. The generated submission ID and the received
+    # timestamp differ on every attempt, so taking the mapping rather than the
+    # whole submission makes their exclusion structural instead of a promise.
+    #
+    # The canonical form is a JSON array of ``[name, [values]]`` pairs, so it is
+    # sensitive to field order and to repeated values, both of which this service
+    # already treats as meaningful. JSON also makes the framing unambiguous:
+    # concatenating names and values would let two different submissions produce
+    # identical bytes. Nothing here depends on Python's randomized hashing, so
+    # the digest is stable across processes and restarts.
+    canonical = json.dumps(
+        [[name, list(values)] for name, values in fields.items()],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def is_valid_endpoint_id(value: str) -> bool:
