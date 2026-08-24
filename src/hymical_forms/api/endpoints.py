@@ -7,14 +7,16 @@ from __future__ import annotations
 from datetime import datetime
 from http import HTTPStatus
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-from hymical_forms import storage
+from hymical_forms import storage, webhooks
+from hymical_forms.config import Settings
 from hymical_forms.db import SessionDep
 from hymical_forms.errors import ApiError, ErrorResponse
 from hymical_forms.ingestion import ENDPOINT_ID_RULE, is_valid_endpoint_id
 from hymical_forms.models import ENDPOINT_NAME_MAX_LENGTH
+from hymical_forms.webhooks import WEBHOOK_URL_MAX_LENGTH
 
 router = APIRouter(tags=["endpoints"])
 
@@ -56,6 +58,22 @@ class EndpointIdConflict(ApiError):
         )
 
 
+class InvalidWebhookUrl(ApiError):
+    """
+    raised when a webhook destination is malformed or not permitted
+    """
+
+    status_code = HTTPStatus.UNPROCESSABLE_ENTITY
+    code = "invalid_webhook_url"
+
+    def __init__(self, reason: str) -> None:
+        """
+        report why the destination was refused
+        :param reason: short phrase completing "the webhook URL ..."
+        """
+        super().__init__(f"The webhook URL {reason}.", details={"field": "webhook_url"})
+
+
 class CreateEndpointRequest(BaseModel):
     """
     the body accepted when creating an endpoint
@@ -71,6 +89,14 @@ class CreateEndpointRequest(BaseModel):
         default=True,
         description="Whether the endpoint accepts submissions. Inactive endpoints reject them.",
     )
+    webhook_url: str | None = Field(
+        default=None,
+        max_length=WEBHOOK_URL_MAX_LENGTH,
+        description=(
+            "Optional http or https destination to deliver accepted submissions to. "
+            "A signing secret is generated for it and returned once."
+        ),
+    )
 
 
 class EndpointResponse(BaseModel):
@@ -82,6 +108,15 @@ class EndpointResponse(BaseModel):
     name: str = Field(description="Human-readable label for the endpoint.")
     is_active: bool = Field(description="Whether the endpoint currently accepts submissions.")
     created_at: datetime = Field(description="UTC timestamp of when the endpoint was created.")
+    webhook_url: str | None = Field(
+        description="Where accepted submissions are delivered, or null if none is configured."
+    )
+    webhook_secret: str | None = Field(
+        description=(
+            "The signing secret for this endpoint's webhook. Returned only here, at "
+            "creation, and never retrievable again. Null if no webhook is configured."
+        )
+    )
 
 
 @router.post(
@@ -90,21 +125,41 @@ class EndpointResponse(BaseModel):
     summary="Create a form endpoint",
     responses={
         409: {"model": ErrorResponse, "description": "Endpoint ID already taken"},
-        422: {"model": ErrorResponse, "description": "Invalid endpoint ID or name"},
+        422: {
+            "model": ErrorResponse,
+            "description": "Invalid endpoint ID, name, or webhook URL",
+        },
         503: {"model": ErrorResponse, "description": "Database unavailable"},
     },
 )
-def create_endpoint(payload: CreateEndpointRequest, session: SessionDep) -> EndpointResponse:
+def create_endpoint(
+    payload: CreateEndpointRequest, request: Request, session: SessionDep
+) -> EndpointResponse:
     """
     create an endpoint that submissions may then be addressed to
-    :param payload: the endpoint identifier, label, and initial active state
+    :param payload: the endpoint identifier, label, active state and optional webhook
+    :param request: the incoming request, read for the active configuration
     :param session: the session this request does its database work through
-    :returns: the endpoint as persisted
+    :returns: the endpoint as persisted, including its signing secret if one was made
     """
     # A plain ``def`` route, so FastAPI runs it in a worker thread and the
     # synchronous database calls never block the event loop.
     if not is_valid_endpoint_id(payload.id):
         raise InvalidEndpointId()
+
+    settings: Settings = request.app.state.settings
+    secret: str | None = None
+    if payload.webhook_url is not None:
+        try:
+            webhooks.validate_webhook_url(
+                payload.webhook_url,
+                allow_private_targets=settings.allow_private_webhook_targets,
+            )
+        except webhooks.WebhookUrlRejected as exc:
+            raise InvalidWebhookUrl(exc.reason) from exc
+        # Generated here rather than accepted from the caller, so its strength is
+        # this service's responsibility and never an integrator's oversight.
+        secret = webhooks.new_signing_secret()
 
     try:
         endpoint = storage.create_endpoint(
@@ -112,15 +167,22 @@ def create_endpoint(payload: CreateEndpointRequest, session: SessionDep) -> Endp
             endpoint_id=payload.id,
             name=payload.name,
             is_active=payload.is_active,
+            webhook_url=payload.webhook_url,
+            webhook_secret=secret,
         )
     except storage.EndpointAlreadyExists as exc:
         raise EndpointIdConflict(payload.id) from exc
 
     session.commit()
 
+    # The secret leaves the service exactly once, in this response. There is no
+    # route that reads it back, so a caller that loses it has to make a new
+    # endpoint rather than being handed the old secret again.
     return EndpointResponse(
         id=endpoint.id,
         name=endpoint.name,
         is_active=endpoint.is_active,
         created_at=endpoint.created_at,
+        webhook_url=endpoint.webhook_url,
+        webhook_secret=secret,
     )

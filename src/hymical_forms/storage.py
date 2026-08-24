@@ -3,9 +3,11 @@ persistence operations, the only place queries are written
 
 Most functions here leave the commit to the caller, so a request handler decides
 when its work becomes durable and a failure anywhere before that commit leaves
-the database untouched. :func:`store_submission` is the exception and owns its
-transaction, because settling an idempotency race means rolling back a failed
-insert and reading again, which cannot be split across a caller boundary.
+the database untouched. Two functions own their transaction and say so:
+:func:`store_submission`, because settling an idempotency race means rolling back
+a failed insert and reading again, and :func:`record_delivery_attempt`, because a
+delivery attempt is written after the submission it describes is already durable
+and must never be able to undo it.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from hymical_forms import models
 from hymical_forms.ingestion import Submission
+from hymical_forms.webhooks import DeliveryResult, new_delivery_attempt_id
 
 
 class EndpointAlreadyExists(Exception):
@@ -35,7 +38,13 @@ class EndpointAlreadyExists(Exception):
 
 
 def create_endpoint(
-    session: Session, *, endpoint_id: str, name: str, is_active: bool
+    session: Session,
+    *,
+    endpoint_id: str,
+    name: str,
+    is_active: bool,
+    webhook_url: str | None = None,
+    webhook_secret: str | None = None,
 ) -> models.Endpoint:
     """
     add an endpoint, failing if the identifier is taken
@@ -43,10 +52,18 @@ def create_endpoint(
     :param endpoint_id: the public identifier the endpoint will answer on
     :param name: human-readable label for the endpoint
     :param is_active: whether the endpoint should accept submissions straight away
+    :param webhook_url: destination to deliver submissions to, or None for no webhook
+    :param webhook_secret: signing secret for that destination, set only alongside a URL
     :returns: the pending endpoint, not yet committed
     :raises EndpointAlreadyExists: if an endpoint already holds that identifier
     """
-    endpoint = models.Endpoint(id=endpoint_id, name=name, is_active=is_active)
+    endpoint = models.Endpoint(
+        id=endpoint_id,
+        name=name,
+        is_active=is_active,
+        webhook_url=webhook_url,
+        webhook_secret=webhook_secret,
+    )
     session.add(endpoint)
     try:
         # Flushing here turns the unique violation into a catchable error while
@@ -165,6 +182,37 @@ def store_submission(
         return StoredSubmission(_settle(existing, payload_fingerprint), replayed=True)
 
     return StoredSubmission(submission, replayed=False)
+
+
+def record_delivery_attempt(
+    session: Session,
+    *,
+    submission_id: str,
+    destination_url: str,
+    result: DeliveryResult,
+) -> models.DeliveryAttempt:
+    """
+    write the record of one webhook delivery attempt, in its own transaction
+    :param session: the session to write through
+    :param submission_id: the submission the attempt was delivering
+    :param destination_url: the URL the attempt was sent to
+    :param result: the outcome of the attempt
+    :returns: the committed attempt record
+    """
+    # This commit is separate from the submission's on purpose. The submission is
+    # already durable by the time an attempt exists, and nothing about recording
+    # what happened afterwards may be able to take it back.
+    attempt = models.DeliveryAttempt(
+        id=new_delivery_attempt_id(),
+        submission_id=submission_id,
+        destination_url=destination_url,
+        outcome=str(result.outcome),
+        response_status=result.response_status,
+        error=result.error,
+    )
+    session.add(attempt)
+    session.commit()
+    return attempt
 
 
 def _settle(existing: models.Submission, payload_fingerprint: str | None) -> Submission:

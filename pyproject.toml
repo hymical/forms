@@ -21,6 +21,7 @@ classifiers = [
 ]
 dependencies = [
     "fastapi>=0.115",
+    "httpx2>=2.0",  # outbound webhook client, and the transport starlette's TestClient uses
     "psycopg[binary]>=3.1",  # PostgreSQL driver for the intended production database
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
@@ -31,7 +32,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "httpx2>=2.0",  # transport used by starlette.testclient
     "mypy>=1.11",
     "pytest>=8.3",
     "ruff>=0.6",

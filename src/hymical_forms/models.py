@@ -25,8 +25,15 @@ from hymical_forms.ingestion import (
     SUBMISSION_ID_MAX_LENGTH,
 )
 from hymical_forms.ingestion import Submission as DomainSubmission
+from hymical_forms.webhooks import (
+    DELIVERY_ATTEMPT_ID_MAX_LENGTH,
+    DELIVERY_ERROR_MAX_LENGTH,
+    WEBHOOK_SECRET_MAX_LENGTH,
+    WEBHOOK_URL_MAX_LENGTH,
+)
 
 ENDPOINT_NAME_MAX_LENGTH = 200
+DELIVERY_OUTCOME_MAX_LENGTH = 32
 
 
 def utcnow() -> datetime:
@@ -94,10 +101,28 @@ class Endpoint(Base):
     # a join without buying anything.
     __tablename__ = "endpoints"
 
+    __table_args__ = (
+        # An endpoint either has a full webhook configuration or none of it. A URL
+        # without a secret would mean sending unsigned payloads, which no receiver
+        # could trust.
+        CheckConstraint(
+            "(webhook_url IS NULL) = (webhook_secret IS NULL)",
+            name="ck_endpoints_webhook_configuration",
+        ),
+    )
+
     id: Mapped[str] = mapped_column(String(ENDPOINT_ID_MAX_LENGTH), primary_key=True)
     name: Mapped[str] = mapped_column(String(ENDPOINT_NAME_MAX_LENGTH))
     is_active: Mapped[bool] = mapped_column(default=True)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+
+    # One destination per endpoint, held here rather than in a table of its own.
+    # A separate table would only start paying for itself with several
+    # destinations, which this build deliberately does not have.
+    webhook_url: Mapped[str | None] = mapped_column(String(WEBHOOK_URL_MAX_LENGTH), default=None)
+    webhook_secret: Mapped[str | None] = mapped_column(
+        String(WEBHOOK_SECRET_MAX_LENGTH), default=None
+    )
 
 
 class Submission(Base):
@@ -189,3 +214,32 @@ class Submission(Base):
             received_at=self.received_at,
             fields={name: tuple(values) for name, values in self.fields.items()},
         )
+
+
+class DeliveryAttempt(Base):
+    """
+    a record of one attempt to deliver a submission to its webhook
+    """
+
+    __tablename__ = "delivery_attempts"
+
+    id: Mapped[str] = mapped_column(String(DELIVERY_ATTEMPT_ID_MAX_LENGTH), primary_key=True)
+    submission_id: Mapped[str] = mapped_column(
+        String(SUBMISSION_ID_MAX_LENGTH),
+        ForeignKey("submissions.id"),
+        index=True,
+    )
+
+    # The URL as it was used, not as it is configured now, so the record still
+    # explains itself after the endpoint's destination changes.
+    destination_url: Mapped[str] = mapped_column(String(WEBHOOK_URL_MAX_LENGTH))
+    attempted_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+
+    # Stored as plain text rather than a database enum, because a database enum
+    # would need a migration to gain a value and there is no migration tool yet.
+    outcome: Mapped[str] = mapped_column(String(DELIVERY_OUTCOME_MAX_LENGTH))
+    response_status: Mapped[int | None] = mapped_column(default=None)
+
+    # Response bodies are deliberately not stored. They are unbounded, written by
+    # somebody else's server, and nothing in this build reads them back.
+    error: Mapped[str | None] = mapped_column(String(DELIVERY_ERROR_MAX_LENGTH), default=None)

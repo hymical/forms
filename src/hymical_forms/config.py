@@ -50,3 +50,21 @@ class Settings(BaseSettings):
         ge=1,
         description="Largest field value accepted, in characters.",
     )
+    webhook_connect_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description="How long to wait for a webhook destination to accept a connection.",
+    )
+    webhook_read_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        description="How long to wait for a webhook destination to respond.",
+    )
+    allow_private_webhook_targets: bool = Field(
+        default=False,
+        description=(
+            "Permit webhook destinations on loopback and private addresses. "
+            "For local development and tests only; enabling it in production "
+            "exposes the server to SSRF."
+        ),
+    )

@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from hymical_forms.app import create_app
 from hymical_forms.config import Settings
+from webhook_server import WebhookRecorder
 
 URLENCODED_HEADERS = {"content-type": "application/x-www-form-urlencoded"}
 
@@ -69,6 +70,7 @@ def create_endpoint(
     *,
     name: str = DEFAULT_ENDPOINT_NAME,
     is_active: bool = True,
+    webhook_url: str | None = None,
 ) -> dict[str, Any]:
     """
     register an endpoint through the public API, failing loudly if it does not take
@@ -76,12 +78,13 @@ def create_endpoint(
     :param endpoint_id: the public identifier to register
     :param name: human-readable label for the endpoint
     :param is_active: whether the endpoint should accept submissions
+    :param webhook_url: destination to deliver submissions to, or None for no webhook
     :returns: the created endpoint as the API returned it
     """
-    response = client.post(
-        "/endpoints",
-        json={"id": endpoint_id, "name": name, "is_active": is_active},
-    )
+    body: dict[str, Any] = {"id": endpoint_id, "name": name, "is_active": is_active}
+    if webhook_url is not None:
+        body["webhook_url"] = webhook_url
+    response = client.post("/endpoints", json=body)
     assert response.status_code == 201, response.text
     return cast(dict[str, Any], response.json())
 
@@ -95,6 +98,16 @@ def open_session(client: TestClient) -> Session:
     app = cast(FastAPI, client.app)
     factory: sessionmaker[Session] = app.state.session_factory
     return factory()
+
+
+@pytest.fixture
+def webhook() -> Iterator[WebhookRecorder]:
+    """
+    provide a running local server that records the webhooks delivered to it
+    :returns: an iterator yielding the recorder, stopped when the test ends
+    """
+    with WebhookRecorder() as recorder:
+        yield recorder
 
 
 @pytest.fixture
