@@ -20,6 +20,7 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
 ]
 dependencies = [
+    "alembic>=1.13",  # schema migrations, and the startup check that they were applied
     "fastapi>=0.115",
     "httpx2>=2.0",  # outbound webhook client, and the transport starlette's TestClient uses
     "psycopg[binary]>=3.1",  # PostgreSQL driver for the intended production database
@@ -51,6 +52,9 @@ packages = ["src/hymical_forms"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers --strict-config"
+markers = [
+    "postgres: needs a live PostgreSQL database, named by HYMICAL_TEST_POSTGRES_URL",
+]
 
 [tool.ruff]
 target-version = "py311"

@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from conftest import URLENCODED_HEADERS, build_settings
 from hymical_forms.app import create_app
+from hymical_forms.schema import create_all
 
 ENDPOINT = "/f/contact-form"
 
@@ -107,6 +108,7 @@ def test_wrong_methods_use_the_envelope(client: TestClient) -> None:
 
 def test_unexpected_errors_do_not_leak_internals() -> None:
     app = create_app(build_settings())
+    create_all(app.state.engine)
 
     @app.get("/boom")
     async def boom() -> None:

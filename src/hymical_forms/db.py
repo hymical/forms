@@ -1,5 +1,8 @@
 """
-database engine, session, and schema lifecycle
+database engine and session lifecycle
+
+Creating the schema is not here and is not the application's job: Alembic owns
+it, and :mod:`hymical_forms.schema` is where the two meet.
 """
 
 from __future__ import annotations
@@ -13,8 +16,6 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 from starlette.requests import Request
-
-from hymical_forms.models import Base
 
 
 def create_engine_from_url(url: str) -> Engine:
@@ -62,16 +63,6 @@ def create_session_factory(engine: Engine) -> sessionmaker[Session]:
     # ``expire_on_commit=False`` keeps loaded values readable after a commit, so
     # building a response out of a just-committed row costs no extra query.
     return sessionmaker(bind=engine, expire_on_commit=False)
-
-
-def init_db(engine: Engine) -> None:
-    """
-    create any tables that do not exist yet
-    :param engine: the engine whose database should hold the schema
-    """
-    # There is no migration framework yet, so this is the whole schema story: it
-    # creates missing tables and never alters existing ones.
-    Base.metadata.create_all(engine)
 
 
 def get_session(request: Request) -> Iterator[Session]:

@@ -40,10 +40,10 @@ and no spam protection, so do not expose this to the public internet.
 | Signed webhook delivery       | Implemented               |
 | Durable delivery queue        | Implemented               |
 | Retries with backoff          | Implemented               |
+| Schema migrations             | Implemented               |
 | API keys / authentication     | **Not implemented**       |
 | Manual delivery replay        | **Not implemented**       |
 | Rate limiting, spam handling  | **Not implemented**       |
-| Schema migrations             | **Not implemented**       |
 | Export, retention, dashboards | **Not implemented**       |
 
 ## Requirements
@@ -81,7 +81,12 @@ See [`.env.example`](.env.example) for every setting and its default.
 
 ## Run
 
-Hymical Forms is two processes sharing one database.
+Hymical Forms is two processes sharing one database. Migrate it first, then
+start them:
+
+```bash
+alembic upgrade head
+```
 
 ```bash
 uvicorn hymical_forms.main:app --reload
@@ -96,22 +101,88 @@ It never makes an outbound request. The **worker** claims owed deliveries, sends
 them, and retries the ones that fail. Running the API alone is fine: submissions
 are still accepted and nothing is lost, they simply wait until a worker exists.
 
-Missing tables are created at startup, so an empty database is enough to begin.
-Startup fails if the database cannot be reached, rather than serving requests
-that would only fail later. There is no migration framework yet, so startup
-never alters a table that already exists; see [Limitations](#limitations).
+Neither process creates or alters the schema. Both check on startup that the
+database is reachable and at the migration revision the build was written
+against, and refuse to start otherwise:
 
-> **Upgrading from an earlier build:** the schema has changed in every release so
-> far, most recently by adding the `webhook_deliveries` table and giving
-> `delivery_attempts` a `delivery_id` and `attempt_number`. Startup creates
-> missing tables but never alters an existing one, so a database created before
-> these changes has to be recreated. For local SQLite, delete the file and
-> restart. For PostgreSQL, `DROP TABLE delivery_attempts, webhook_deliveries,
-> submissions, endpoints;` and restart. There is no in-place upgrade path.
->
-> Three consecutive schema changes with no migration tool is the clearest
-> remaining infrastructure gap. Alembic is the next thing this project needs,
-> and it should arrive before there is a database worth not dropping.
+```
+the database is at migration '0001' but this build expects '0002'.
+Run 'alembic upgrade head' before starting.
+```
+
+Migrating is an operator action, run when the operator chooses. See
+[Schema migrations](#schema-migrations).
+
+## Schema migrations
+
+Alembic owns the schema. Neither the API nor the worker creates or alters a
+table: they check on startup that the database is at the revision they were
+built against, and stop if it is not.
+
+### A fresh database
+
+```bash
+createdb forms
+export FORMS_DATABASE_URL=postgresql+psycopg://forms:forms@localhost:5432/forms
+alembic upgrade head
+```
+
+That is the whole setup. Migrations read `FORMS_DATABASE_URL`, the same setting
+the application reads, so there is nothing extra to configure and no credentials
+in any tracked file. To migrate a different database without changing your
+environment:
+
+```bash
+alembic -x database_url=postgresql+psycopg://user:pass@host/other upgrade head
+```
+
+### Upgrading an existing database
+
+```bash
+alembic upgrade head        # apply everything outstanding
+```
+
+Run it before starting the new build. The usual order for a deploy is: stop the
+old processes, migrate, start the new ones. Migrating while an old build is
+still running is only safe if the change happens to be backwards compatible,
+and this project does not promise that for any particular migration.
+
+Useful alongside it:
+
+```bash
+alembic current             # what revision is this database at
+alembic history --verbose   # what revisions exist
+alembic upgrade head --sql  # print the SQL instead of applying it, for review
+alembic downgrade -1        # step back one revision
+```
+
+`--sql` is worth knowing about: it lets whoever owns the production database
+read the DDL before anything touches it.
+
+### SQLite
+
+Migrations run against SQLite too, so local experimentation works the same way:
+
+```bash
+export FORMS_DATABASE_URL=sqlite:///./forms.db
+alembic upgrade head
+```
+
+Migrations that alter a column are written in batch mode, because SQLite cannot
+`ALTER` in place and has to rebuild the table instead. This is configured
+already; it is not something a migration author has to remember.
+
+### Writing a migration
+
+```bash
+alembic revision --autogenerate -m "what changed"
+```
+
+**Read what it produces before committing it.** Autogenerate is a starting
+point, not an answer: it does not always render custom column types in a usable
+way, and it cannot see anything the models do not declare. The PostgreSQL suite
+asserts that migrations and models describe the same schema, so drift fails the
+build rather than surfacing in production.
 
 Interactive API documentation is served at `http://127.0.0.1:8000/docs`.
 
@@ -520,8 +591,28 @@ ruff format --check .     # formatting check
 mypy                      # type check
 ```
 
-Tests run against an in-memory SQLite database, one per test, so no database
-server is needed and nothing is left behind.
+### Two test layers
+
+Most tests run against an in-memory SQLite database, one per test, so `pytest`
+needs no services and leaves nothing behind. Their schema is built from the
+models and stamped as migrated, rather than replayed migration by migration,
+because doing that a few hundred times would cost far more than it proves.
+
+A smaller suite under `tests/integration/` runs against a real PostgreSQL
+database, for the things SQLite cannot model honestly: `SELECT ... FOR UPDATE
+SKIP LOCKED`, real constraint enforcement, and genuinely concurrent worker
+sessions. It skips itself unless you point it at a database it may destroy:
+
+```bash
+export HYMICAL_TEST_POSTGRES_URL=postgresql+psycopg://forms:forms@localhost:5432/forms_test
+pytest tests/integration -m postgres
+```
+
+One of those tests asserts that the migrations and the models describe the same
+schema, which is what keeps the fast suite's shortcut honest.
+
+CI runs the lint, format and type checks once, the fast suite across Python
+3.11 to 3.13, and the PostgreSQL suite once against a PostgreSQL 17 service.
 
 ### Layout
 
@@ -529,7 +620,7 @@ server is needed and nothing is left behind.
 src/hymical_forms/
   app.py            application assembly and startup
   config.py         typed settings
-  db.py             engine, session, and schema lifecycle
+  db.py             engine and session lifecycle
   errors.py         the shared JSON error envelope
   delivery.py       the outbound webhook request itself
   ingestion.py      domain rules: endpoint IDs, submission validation
@@ -538,8 +629,10 @@ src/hymical_forms/
   storage.py        queries and writes
   webhooks.py       webhook rules: URL validation, payload, signature, retry policy
   worker.py         the delivery worker process
+  schema.py         the boundary between the application and Alembic
   main.py           ASGI entrypoint
   api/              HTTP routes and response models
+  migrations/       Alembic environment and revisions
 ```
 
 `ingestion.py` and `webhooks.py` hold the domain rules and know nothing about
@@ -585,17 +678,19 @@ so the claim also performs a conditional update and treats a row as claimed only
 if that update matched. That guard is redundant under `SKIP LOCKED` and is what
 makes the claim safe on SQLite.
 
+This is covered by real integration tests: concurrent PostgreSQL sessions claim
+disjoint work, a row another worker holds is skipped rather than waited on, and
+an expired lease becomes reclaimable by exactly one worker.
+
 ## Limitations
 
 - **Delivery is at-least-once, never exactly-once.** A worker that delivers
   successfully and dies before recording it will have its lease expire, and the
   next worker will deliver the same event again. Deduplicate on the submission
   `id` in the signed payload.
-- **PostgreSQL worker concurrency is not exercised by the test suite.** Tests run
-  on SQLite, which cannot model `SELECT ... FOR UPDATE SKIP LOCKED`. The
-  generated PostgreSQL SQL is asserted, and the claim is written so that it is
-  also correct without row locking, but two real workers racing on PostgreSQL has
-  not been run. A PostgreSQL service in CI is the way to close this.
+- **Only one migration exists so far.** The upgrade path is real and tested, but
+  it has only ever been exercised from an empty database to the baseline. Nothing
+  has yet had to migrate data it cared about.
 - **A failed delivery is final and cannot be replayed.** Once a delivery reaches
   `failed`, nothing retries it and there is no manual replay route.
 - **The lease must outlast a delivery attempt.** A batch is delivered
@@ -618,9 +713,11 @@ makes the claim safe on SQLite.
   to change a destination or rotate a signing secret.
 - **No API for delivery attempts.** They are recorded, but reading them means
   querying the database directly.
-- **No migration framework.** Startup creates missing tables and nothing else,
-  so any future change to an existing column has to be applied by hand.
-  Alembic will arrive when the schema first needs to change.
+- **Migrations are applied by hand, one command at a time.** There is no
+  zero-downtime story and none is claimed: a migration that rewrites a table
+  will lock it, and a build whose expected revision does not match the database
+  refuses to start rather than serving against a schema it does not understand.
+  Plan a deploy as migrate-then-restart.
 - **No way to read submissions back over the API.** They are stored, but
   retrieval, export and retention are not implemented.
 - **No route to list, update or delete endpoints.**
