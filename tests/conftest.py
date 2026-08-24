@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from hymical_forms.app import create_app
 from hymical_forms.config import Settings
 from hymical_forms.delivery import create_webhook_client
+from hymical_forms.schema import create_all
 from hymical_forms.worker import process_batch
 from webhook_server import WebhookRecorder
 
@@ -161,7 +162,14 @@ def make_client() -> Iterator[ClientFactory]:
             :param overrides: setting values to replace the built-in defaults
             :returns: a test client closed when the fixture tears down
             """
-            client = stack.enter_context(TestClient(create_app(build_settings(**overrides))))
+            # The schema is built from the models and stamped, rather than
+            # migrated, because replaying migrations for each of a couple of
+            # hundred tests would cost far more than it proves. That the two
+            # produce the same schema is asserted once, against PostgreSQL, in
+            # the integration suite.
+            app = create_app(build_settings(**overrides))
+            create_all(app.state.engine)
+            client = stack.enter_context(TestClient(app))
             if seed_endpoint:
                 create_endpoint(client)
             return client

@@ -12,9 +12,10 @@ from fastapi import FastAPI
 from hymical_forms import __version__
 from hymical_forms.api import endpoints, health, submissions
 from hymical_forms.config import Settings
-from hymical_forms.db import create_engine_from_url, create_session_factory, init_db
+from hymical_forms.db import create_engine_from_url, create_session_factory
 from hymical_forms.errors import register_exception_handlers
 from hymical_forms.middleware import BodySizeLimitMiddleware
+from hymical_forms.schema import verify_schema
 
 DESCRIPTION = """\
 Hymical Forms accepts HTML form submissions over HTTP so that developers do not
@@ -29,14 +30,16 @@ performs the webhook delivery and retries it.
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
-    prepare the schema on startup and release the connection pool on shutdown
+    check the schema on startup and release the connection pool on shutdown
     :param app: the application starting up
     :returns: an async context manager wrapping the application's serving life
     """
-    # There is no migration framework yet, so creating missing tables at startup
-    # is the whole schema story. It is safe to repeat and never alters a table
-    # that already exists, which also means a changed column needs manual work.
-    init_db(app.state.engine)
+    # The application never migrates. It reaches the database, confirms the
+    # schema is the revision this build was written against, and refuses to serve
+    # if it is not. Migrating here instead would apply DDL nobody reviewed, at a
+    # moment nobody chose, races every other replica starting at the same time,
+    # and would hide the mismatch this check is meant to surface.
+    verify_schema(app.state.engine)
     yield
     app.state.engine.dispose()
 
