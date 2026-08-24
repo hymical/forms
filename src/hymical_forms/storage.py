@@ -3,12 +3,14 @@ persistence operations, the only place queries are written
 
 Most functions here leave the commit to the caller, so a request handler decides
 when its work becomes durable and a failure anywhere before that commit leaves
-the database untouched. Three functions own their transaction and say so:
+the database untouched. A few own their transaction and say so:
 :func:`store_submission`, because it writes a submission and the obligation to
 deliver it as one atomic unit and must roll both back together to settle an
 idempotency race; :func:`claim_due_deliveries`, because a claim is only worth
-anything once it is committed; and :func:`complete_attempt`, because the audit
-record and the state it justifies have to land together.
+anything once it is committed; :func:`complete_attempt`, because the audit
+record and the state it justifies have to land together; and the two management
+key writes, :func:`revoke_management_key` and :func:`record_management_key_use`,
+because each is the whole of what its caller came to do.
 """
 
 from __future__ import annotations
@@ -377,6 +379,118 @@ def complete_attempt(
 
     session.commit()
     return attempt
+
+
+def create_management_key(
+    session: Session,
+    *,
+    key_id: str,
+    name: str,
+    display_prefix: str,
+    key_digest: str,
+    now: datetime,
+) -> models.ManagementApiKey:
+    """
+    add a management API key, storing only its safe representation
+    :param session: the session to add the key through
+    :param key_id: the non-secret identifier the key will be administered by
+    :param name: human-readable label for the key
+    :param display_prefix: the non-secret fragment shown in a listing
+    :param key_digest: digest of the credential, which is never stored itself
+    :param now: the instant the key was created
+    :returns: the pending key, not yet committed
+    """
+    # The credential is not a parameter here, and that is the point: this
+    # function could not persist it even if a caller wanted it to.
+    key = models.ManagementApiKey(
+        id=key_id,
+        name=name,
+        display_prefix=display_prefix,
+        key_digest=key_digest,
+        created_at=now,
+    )
+    session.add(key)
+    session.flush()
+    return key
+
+
+def find_management_key_by_digest(
+    session: Session, key_digest: str
+) -> models.ManagementApiKey | None:
+    """
+    look up the key a supplied credential digests to
+    :param session: the session to query through
+    :param key_digest: digest of the credential the client sent
+    :returns: the key, or None if no key digests to that value
+    """
+    # Revoked keys are returned too. Whether a key still authenticates is the
+    # caller's decision to make and to answer for, and filtering here would hide
+    # the distinction from the one place that has to be explicit about it.
+    return session.scalars(
+        select(models.ManagementApiKey).where(models.ManagementApiKey.key_digest == key_digest)
+    ).one_or_none()
+
+
+def get_management_key(session: Session, key_id: str) -> models.ManagementApiKey | None:
+    """
+    look a management key up by its non-secret identifier
+    :param session: the session to query through
+    :param key_id: the identifier to resolve
+    :returns: the key, or None if no key holds that identifier
+    """
+    return session.get(models.ManagementApiKey, key_id)
+
+
+def list_management_keys(session: Session) -> list[models.ManagementApiKey]:
+    """
+    read every management key, newest first
+    :param session: the session to query through
+    :returns: the keys, carrying no credential material
+    """
+    return list(
+        session.scalars(
+            select(models.ManagementApiKey).order_by(models.ManagementApiKey.created_at.desc())
+        )
+    )
+
+
+def revoke_management_key(
+    session: Session, key_id: str, *, now: datetime
+) -> models.ManagementApiKey | None:
+    """
+    withdraw a management key without discarding what it was
+    :param session: the session to write through
+    :param key_id: the identifier of the key to revoke
+    :param now: the instant the revocation takes effect
+    :returns: the key, revoked and committed, or None if no such key exists
+    """
+    key = session.get(models.ManagementApiKey, key_id)
+    if key is None:
+        return None
+    # Idempotent, and the first revocation is the one that counts: revoking twice
+    # must not quietly move the moment the credential stopped being valid.
+    if key.revoked_at is None:
+        key.revoked_at = now
+        session.commit()
+    return key
+
+
+def record_management_key_use(session: Session, key_id: str, *, now: datetime) -> None:
+    """
+    note that a key authenticated a request
+    :param session: the session to write through
+    :param key_id: the key that authenticated
+    :param now: the instant the request was authenticated
+    """
+    # An UPDATE rather than a load-and-set, so this costs one statement and does
+    # not put an object in the caller's session that a later rollback would
+    # expire underneath them.
+    session.execute(
+        update(models.ManagementApiKey)
+        .where(models.ManagementApiKey.id == key_id)
+        .values(last_used_at=now)
+    )
+    session.commit()
 
 
 def _settle(existing: models.Submission, payload_fingerprint: str | None) -> Submission:

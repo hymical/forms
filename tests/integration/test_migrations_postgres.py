@@ -8,17 +8,31 @@ from whatever a previous test happened to leave behind.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
+
 from alembic import command
 from alembic.autogenerate import compare_metadata
+from alembic.config import Config
 from alembic.migration import MigrationContext
-from sqlalchemy import inspect, text
+from sqlalchemy import Connection, Engine, inspect, text
 
 from hymical_forms.db import create_engine_from_url
 from hymical_forms.models import Base
 from hymical_forms.schema import alembic_config, current_revision, head_revision
 from integration.support import temporary_database
 
-EXPECTED_TABLES = {"endpoints", "submissions", "webhook_deliveries", "delivery_attempts"}
+BASELINE_TABLES = {"endpoints", "submissions", "webhook_deliveries", "delivery_attempts"}
+EXPECTED_TABLES = BASELINE_TABLES | {"management_api_keys"}
+
+# Representative interval 6 data: an endpoint with a webhook, a submission sent
+# with an idempotency key, the delivery it owes, and one recorded attempt.
+SEEDED_AT = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
+SEEDED_ENDPOINT = "contact-form"
+SEEDED_SUBMISSION = "sub_11111111111111111111111111111111"
+SEEDED_DELIVERY = "whd_22222222222222222222222222222222"
+SEEDED_ATTEMPT = "att_33333333333333333333333333333333"
 
 
 def test_an_empty_database_upgrades_to_head(postgres_url: str) -> None:
@@ -77,6 +91,7 @@ def test_the_migration_creates_the_constraints_the_application_relies_on(
     assert {
         "uq_submissions_endpoint_idempotency_key",
         "uq_webhook_deliveries_submission",
+        "uq_management_api_keys_key_digest",
         "ck_endpoints_webhook_configuration",
         "ck_submissions_idempotency_identity",
         "ck_webhook_deliveries_completion",
@@ -136,3 +151,202 @@ def test_the_migration_round_trips(postgres_url: str) -> None:
             assert difference == []
         finally:
             engine.dispose()
+
+
+# --- upgrading a database that already holds data ----------------------------
+#
+# Interval 6 built the migration machinery but only ever ran it against an empty
+# database. These tests are the first time an upgrade has had to preserve data it
+# cares about, which is the property an operator is actually relying on.
+
+
+def test_upgrading_a_populated_baseline_preserves_its_data(postgres_url: str) -> None:
+    """
+    an existing endpoint, submission, delivery and attempt must survive 0001 to 0002
+    :param postgres_url: a URL on the PostgreSQL server to work against
+    """
+    with _database_at_baseline(postgres_url) as (config, engine):
+        with engine.begin() as connection:
+            _seed_baseline_data(connection)
+
+        command.upgrade(config, "0002")
+
+        assert current_revision(engine) == "0002"
+        with engine.connect() as connection:
+            _assert_baseline_data_intact(connection)
+
+
+def test_upgrading_a_populated_baseline_adds_the_key_table(postgres_url: str) -> None:
+    with _database_at_baseline(postgres_url) as (config, engine):
+        with engine.begin() as connection:
+            _seed_baseline_data(connection)
+        assert "management_api_keys" not in set(inspect(engine).get_table_names())
+
+        command.upgrade(config, "0002")
+
+        assert "management_api_keys" in set(inspect(engine).get_table_names())
+        with engine.connect() as connection:
+            assert connection.scalar(text("select count(*) from management_api_keys")) == 0
+
+
+def test_downgrading_from_0002_leaves_the_baseline_data_alone(postgres_url: str) -> None:
+    """
+    the downgrade must remove only what 0002 added
+    :param postgres_url: a URL on the PostgreSQL server to work against
+    """
+    with _database_at_baseline(postgres_url) as (config, engine):
+        with engine.begin() as connection:
+            _seed_baseline_data(connection)
+        command.upgrade(config, "0002")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "insert into management_api_keys "
+                    "(id, name, display_prefix, key_digest, created_at) "
+                    "values ('mk_test', 'operator', 'hym_live_abcdefgh', :digest, :now)"
+                ),
+                {"digest": "d" * 64, "now": SEEDED_AT},
+            )
+
+        command.downgrade(config, "0001")
+
+        assert current_revision(engine) == "0001"
+        assert "management_api_keys" not in set(inspect(engine).get_table_names())
+        with engine.connect() as connection:
+            _assert_baseline_data_intact(connection)
+
+
+def test_a_populated_database_upgraded_again_still_matches_the_models(postgres_url: str) -> None:
+    """
+    the whole round trip on real data must end with zero migration and model drift
+    :param postgres_url: a URL on the PostgreSQL server to work against
+    """
+    with _database_at_baseline(postgres_url) as (config, engine):
+        with engine.begin() as connection:
+            _seed_baseline_data(connection)
+
+        command.upgrade(config, "0002")
+        command.downgrade(config, "0001")
+        command.upgrade(config, "head")
+
+        assert current_revision(engine) == head_revision()
+        with engine.connect() as connection:
+            _assert_baseline_data_intact(connection)
+            difference = compare_metadata(MigrationContext.configure(connection), Base.metadata)
+        assert difference == [], f"migrated schema differs from the models: {difference}"
+
+
+@contextmanager
+def _database_at_baseline(postgres_url: str) -> Iterator[tuple[Config, Engine]]:
+    """
+    provide a throwaway database migrated to 0001 and nothing further
+    :param postgres_url: a URL on the PostgreSQL server to work against
+    :returns: a context manager yielding the alembic config and an engine on it
+    """
+    with temporary_database(postgres_url) as url:
+        config = alembic_config(url)
+        command.upgrade(config, "0001")
+        engine = create_engine_from_url(url)
+        try:
+            yield config, engine
+        finally:
+            engine.dispose()
+
+
+def _seed_baseline_data(connection: Connection) -> None:
+    """
+    insert one of each interval 6 row, as an operator's database would hold
+    :param connection: the connection to insert through
+    """
+    # Written as SQL rather than through the ORM on purpose. The models describe
+    # head, and this data is meant to be what a database at 0001 already contains.
+    connection.execute(
+        text(
+            "insert into endpoints (id, name, is_active, created_at, webhook_url, webhook_secret) "
+            "values (:id, 'Contact form', true, :now, 'https://example.invalid/hook', :secret)"
+        ),
+        {"id": SEEDED_ENDPOINT, "now": SEEDED_AT, "secret": "whsec_" + "a" * 64},
+    )
+    connection.execute(
+        text(
+            "insert into submissions "
+            "(id, endpoint_id, received_at, fields, idempotency_key, payload_fingerprint) "
+            "values (:id, :endpoint, :now, :fields, :key, :fingerprint)"
+        ),
+        {
+            "id": SEEDED_SUBMISSION,
+            "endpoint": SEEDED_ENDPOINT,
+            "now": SEEDED_AT,
+            "fields": '{"email": ["dev@example.com"]}',
+            "key": "b8f1c2d4e5a67890b8f1c2d4e5a67890",
+            "fingerprint": "f" * 64,
+        },
+    )
+    connection.execute(
+        text(
+            "insert into webhook_deliveries "
+            "(id, submission_id, destination_url, signing_secret, state, attempts, "
+            "next_attempt_at, created_at, completed_at) "
+            "values (:id, :submission, 'https://example.invalid/hook', :secret, 'delivered', 1, "
+            ":now, :now, :now)"
+        ),
+        {
+            "id": SEEDED_DELIVERY,
+            "submission": SEEDED_SUBMISSION,
+            "now": SEEDED_AT,
+            "secret": "whsec_" + "a" * 64,
+        },
+    )
+    connection.execute(
+        text(
+            "insert into delivery_attempts "
+            "(id, delivery_id, submission_id, attempt_number, destination_url, attempted_at, "
+            "outcome, response_status) "
+            "values (:id, :delivery, :submission, 1, 'https://example.invalid/hook', :now, "
+            "'succeeded', 200)"
+        ),
+        {
+            "id": SEEDED_ATTEMPT,
+            "delivery": SEEDED_DELIVERY,
+            "submission": SEEDED_SUBMISSION,
+            "now": SEEDED_AT,
+        },
+    )
+
+
+def _assert_baseline_data_intact(connection: Connection) -> None:
+    """
+    check that every seeded row is still there and still says what it said
+    :param connection: the connection to query through
+    """
+    endpoint = connection.execute(
+        text("select name, webhook_url, webhook_secret from endpoints where id = :id"),
+        {"id": SEEDED_ENDPOINT},
+    ).one()
+    assert endpoint.name == "Contact form"
+    assert endpoint.webhook_url == "https://example.invalid/hook"
+    assert endpoint.webhook_secret == "whsec_" + "a" * 64
+
+    submission = connection.execute(
+        text("select endpoint_id, fields, idempotency_key from submissions where id = :id"),
+        {"id": SEEDED_SUBMISSION},
+    ).one()
+    assert submission.endpoint_id == SEEDED_ENDPOINT
+    assert submission.fields == {"email": ["dev@example.com"]}
+    assert submission.idempotency_key == "b8f1c2d4e5a67890b8f1c2d4e5a67890"
+
+    delivery = connection.execute(
+        text("select submission_id, state, attempts from webhook_deliveries where id = :id"),
+        {"id": SEEDED_DELIVERY},
+    ).one()
+    assert delivery.submission_id == SEEDED_SUBMISSION
+    assert delivery.state == "delivered"
+    assert delivery.attempts == 1
+
+    attempt = connection.execute(
+        text("select delivery_id, outcome, response_status from delivery_attempts where id = :id"),
+        {"id": SEEDED_ATTEMPT},
+    ).one()
+    assert attempt.delivery_id == SEEDED_DELIVERY
+    assert attempt.outcome == "succeeded"
+    assert attempt.response_status == 200

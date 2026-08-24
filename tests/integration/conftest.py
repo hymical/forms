@@ -22,7 +22,12 @@ from hymical_forms.app import create_app
 from hymical_forms.db import create_engine_from_url
 from hymical_forms.models import Base
 from hymical_forms.schema import alembic_config
-from integration.support import POSTGRES_URL_VARIABLE, IsolatedSettings, drop_everything
+from integration.support import (
+    POSTGRES_URL_VARIABLE,
+    IsolatedSettings,
+    drop_everything,
+    seed_management_key,
+)
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -90,15 +95,23 @@ def sessions(migrated_engine: Engine) -> sessionmaker[Session]:
 
 
 @pytest.fixture
-def pg_client(postgres_url: str, migrated_engine: Engine) -> Iterator[TestClient]:
+def pg_client(
+    postgres_url: str, migrated_engine: Engine, sessions: sessionmaker[Session]
+) -> Iterator[TestClient]:
     """
     provide an API client backed by the migrated PostgreSQL database
     :param postgres_url: the database URL to run against
     :param migrated_engine: unused, but forces the schema to exist first
+    :param sessions: session factory used to mint the client's management key
     :returns: an iterator yielding a test client
     """
     app = create_app(
         IsolatedSettings(database_url=postgres_url, allow_private_webhook_targets=True)
     )
+    # Issued after ``clean_database`` has truncated everything, so the key exists
+    # for exactly the test that is about to run.
+    with sessions() as session:
+        key = seed_management_key(session)
     with TestClient(app) as client:
+        client.headers["Authorization"] = f"Bearer {key}"
         yield client

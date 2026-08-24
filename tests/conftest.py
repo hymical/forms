@@ -5,6 +5,12 @@ Tests build their own application instances so that limits can be lowered to
 values that are cheap to exercise, and so that a developer's local environment
 can never change a test's outcome. Each application gets its own in-memory
 SQLite database, which starts empty and disappears when the test ends.
+
+Each application also gets a management API key, written straight into its
+database the way the operator CLI writes one. Clients send it by default so that
+the tests which are about ingestion stay about ingestion; a client built with
+``authenticate=False`` genuinely sends no ``Authorization`` header, which is what
+the public-route tests need.
 """
 
 from __future__ import annotations
@@ -22,14 +28,19 @@ from fastapi.testclient import TestClient
 from pydantic_settings import SettingsConfigDict
 from sqlalchemy.orm import Session, sessionmaker
 
+from hymical_forms import apikeys, storage
 from hymical_forms.app import create_app
 from hymical_forms.config import Settings
 from hymical_forms.delivery import create_webhook_client
+from hymical_forms.models import utcnow
 from hymical_forms.schema import create_all
 from hymical_forms.worker import process_batch
 from webhook_server import WebhookRecorder
 
 URLENCODED_HEADERS = {"content-type": "application/x-www-form-urlencoded"}
+
+AUTHORIZATION_HEADER = "Authorization"
+DEFAULT_KEY_NAME = "test-operator"
 
 DEFAULT_ENDPOINT_ID = "contact-form"
 DEFAULT_ENDPOINT_NAME = "Contact form"
@@ -76,22 +87,67 @@ def create_endpoint(
     name: str = DEFAULT_ENDPOINT_NAME,
     is_active: bool = True,
     webhook_url: str | None = None,
+    api_key: str | None = None,
 ) -> dict[str, Any]:
     """
-    register an endpoint through the public API, failing loudly if it does not take
+    register an endpoint through the management API, failing loudly if it does not take
     :param client: the client whose application should hold the endpoint
     :param endpoint_id: the public identifier to register
     :param name: human-readable label for the endpoint
     :param is_active: whether the endpoint should accept submissions
     :param webhook_url: destination to deliver submissions to, or None for no webhook
+    :param api_key: management key to authenticate with, or None to use the client's own
     :returns: the created endpoint as the API returned it
     """
     body: dict[str, Any] = {"id": endpoint_id, "name": name, "is_active": is_active}
     if webhook_url is not None:
         body["webhook_url"] = webhook_url
-    response = client.post("/endpoints", json=body)
+    headers = bearer(api_key) if api_key is not None else None
+    response = client.post("/endpoints", json=body, headers=headers)
     assert response.status_code == 201, response.text
     return cast(dict[str, Any], response.json())
+
+
+def bearer(api_key: str) -> dict[str, str]:
+    """
+    build the authorization header a management request carries
+    :param api_key: the full management key
+    :returns: headers authenticating as that key
+    """
+    return {AUTHORIZATION_HEADER: f"Bearer {api_key}"}
+
+
+def issue_management_key(client: TestClient, *, name: str = DEFAULT_KEY_NAME) -> str:
+    """
+    mint a management key into the client's database, the way the operator CLI does
+    :param client: the client whose application database should hold the key
+    :param name: human-readable label for the key
+    :returns: the full credential, which exists only here and in the caller
+    """
+    # Written through the same domain and storage functions the CLI uses, rather
+    # than through a fixture-only shortcut, so what the tests authenticate with
+    # is what an operator would actually be holding.
+    generated = apikeys.new_management_key()
+    with open_session(client) as session:
+        storage.create_management_key(
+            session,
+            key_id=generated.id,
+            name=name,
+            display_prefix=generated.display_prefix,
+            key_digest=generated.digest,
+            now=utcnow(),
+        )
+        session.commit()
+    return generated.key
+
+
+def management_key(client: TestClient) -> str:
+    """
+    read the management key an authenticated client sends
+    :param client: a client built with authentication enabled
+    :returns: the full credential the fixture issued for it
+    """
+    return client.headers[AUTHORIZATION_HEADER].removeprefix("Bearer ")
 
 
 def app_settings(client: TestClient) -> Settings:
@@ -155,10 +211,13 @@ def make_client() -> Iterator[ClientFactory]:
     """
     with ExitStack() as stack:
 
-        def factory(*, seed_endpoint: bool = True, **overrides: Any) -> TestClient:
+        def factory(
+            *, seed_endpoint: bool = True, authenticate: bool = True, **overrides: Any
+        ) -> TestClient:
             """
             build a client for an app configured with the given overrides
             :param seed_endpoint: whether to register the default endpoint first
+            :param authenticate: whether the client should send its management key by default
             :param overrides: setting values to replace the built-in defaults
             :returns: a test client closed when the fixture tears down
             """
@@ -170,8 +229,15 @@ def make_client() -> Iterator[ClientFactory]:
             app = create_app(build_settings(**overrides))
             create_all(app.state.engine)
             client = stack.enter_context(TestClient(app))
+
+            # A key always exists, so seeding an endpoint works either way. Only
+            # whether the client sends it by default depends on ``authenticate``,
+            # which is what lets a test prove a route is reachable without one.
+            key = issue_management_key(client)
+            if authenticate:
+                client.headers[AUTHORIZATION_HEADER] = f"Bearer {key}"
             if seed_endpoint:
-                create_endpoint(client)
+                create_endpoint(client, api_key=key)
             return client
 
         yield factory
