@@ -1,9 +1,10 @@
-"""Ingestion domain rules: endpoint identifiers and submission normalization.
+"""
+ingestion domain rules: endpoint identifiers and submission normalization
 
-This module is deliberately free of HTTP concepts. It answers two questions —
-"is this a well-formed endpoint identifier?" and "is this set of name/value pairs
-an acceptable submission?" — and leaves status codes and wire formats to the API
-layer.
+This module is deliberately free of HTTP concepts. It answers two questions,
+"is this a well-formed endpoint identifier?" and "is this set of name/value
+pairs an acceptable submission?", and leaves status codes and wire formats to
+the API layer.
 """
 
 from __future__ import annotations
@@ -30,11 +31,13 @@ SUBMISSION_ID_PREFIX = "sub_"
 
 
 def is_valid_endpoint_id(value: str) -> bool:
-    """Report whether ``value`` is a syntactically valid endpoint identifier.
-
-    Interval 1 has no endpoint registry, so any syntactically valid identifier is
-    treated as addressable.
     """
+    report whether a path segment is a syntactically valid endpoint identifier
+    :param value: candidate identifier taken from the request path
+    :returns: True if the identifier is well formed
+    """
+    # Interval 1 has no endpoint registry, so any syntactically valid identifier
+    # is treated as addressable.
     return (
         ENDPOINT_ID_MIN_LENGTH <= len(value) <= ENDPOINT_ID_MAX_LENGTH
         and _ENDPOINT_ID_PATTERN.fullmatch(value) is not None
@@ -42,9 +45,17 @@ def is_valid_endpoint_id(value: str) -> bool:
 
 
 class SubmissionRejected(Exception):
-    """A submission violated an ingestion rule and must not be accepted."""
+    """
+    raised when a submission violates an ingestion rule and must not be accepted
+    """
 
     def __init__(self, code: str, message: str, details: dict[str, Any] | None = None) -> None:
+        """
+        record why a submission was refused
+        :param code: stable, machine-readable identifier for the broken rule
+        :param message: human-readable explanation of the failure
+        :param details: optional structured context, such as the limit that was exceeded
+        """
         super().__init__(message)
         self.code = code
         self.message = message
@@ -53,13 +64,13 @@ class SubmissionRejected(Exception):
 
 @dataclass(frozen=True, slots=True)
 class Submission:
-    """A validated form submission in its internal representation.
-
-    Repeated field names are preserved as ordered tuples because HTML forms use
-    them for checkbox groups and multi-selects; collapsing them would silently
-    discard user input.
+    """
+    a validated form submission in its internal representation
     """
 
+    # Repeated field names are preserved as ordered tuples because HTML forms use
+    # them for checkbox groups and multi-selects; collapsing them would silently
+    # discard user input.
     id: str
     endpoint_id: str
     received_at: datetime
@@ -67,12 +78,18 @@ class Submission:
 
     @property
     def field_count(self) -> int:
-        """The number of name/value pairs the submission carries."""
+        """
+        count the name/value pairs the submission carries
+        :returns: the total number of submitted values across all field names
+        """
         return sum(len(values) for values in self.fields.values())
 
 
 def new_submission_id() -> str:
-    """Generate an opaque, prefixed submission identifier."""
+    """
+    generate an opaque, prefixed submission identifier
+    :returns: a fresh submission id such as ``sub_1f0c9a...``
+    """
     return f"{SUBMISSION_ID_PREFIX}{uuid.uuid4().hex}"
 
 
@@ -84,13 +101,15 @@ def build_submission(
     max_field_name_length: int,
     max_field_value_length: int,
 ) -> Submission:
-    """Validate parsed form pairs and normalize them into a :class:`Submission`.
-
-    ``items`` is the ordered sequence of name/value pairs exactly as parsed from
-    the request body, including repeats.
-
-    Raises:
-        SubmissionRejected: if the submission is empty or breaches a limit.
+    """
+    validate parsed form pairs and normalize them into a submission
+    :param endpoint_id: the endpoint the submission was addressed to
+    :param items: ordered name/value pairs as parsed from the request body, repeats included
+    :param max_fields: largest number of name/value pairs accepted
+    :param max_field_name_length: largest field name accepted, in characters
+    :param max_field_value_length: largest field value accepted, in characters
+    :returns: the normalized submission
+    :raises SubmissionRejected: if the submission is empty or breaches a limit
     """
     if len(items) > max_fields:
         raise SubmissionRejected(
@@ -120,6 +139,12 @@ def build_submission(
 
 
 def _validate_field_name(name: str, max_length: int) -> None:
+    """
+    check a submitted field name against the name rules
+    :param name: field name as submitted
+    :param max_length: largest field name accepted, in characters
+    :raises SubmissionRejected: if the name is empty, too long, or holds control characters
+    """
     if not name:
         raise SubmissionRejected(
             "invalid_field_name",
@@ -139,6 +164,13 @@ def _validate_field_name(name: str, max_length: int) -> None:
 
 
 def _validate_field_value(name: str, value: str, max_length: int) -> None:
+    """
+    check a submitted field value against the value rules
+    :param name: field name the value belongs to, used only in the error message
+    :param value: field value as submitted
+    :param max_length: largest field value accepted, in characters
+    :raises SubmissionRejected: if the value is too long or holds a null byte
+    """
     if len(value) > max_length:
         raise SubmissionRejected(
             "field_value_too_long",

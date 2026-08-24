@@ -1,4 +1,6 @@
-"""Accepting form submissions."""
+"""
+accepting form submissions
+"""
 
 from __future__ import annotations
 
@@ -21,7 +23,10 @@ def test_accepts_a_urlencoded_submission(client: TestClient) -> None:
 
 
 def test_accepts_a_multipart_submission(client: TestClient) -> None:
-    """Browsers send ``enctype="multipart/form-data"`` forms; text parts are accepted."""
+    """
+    browsers send ``enctype="multipart/form-data"`` forms, so text parts are accepted
+    :param client: test client for an app on default settings
+    """
     boundary = "hymicalboundary"
     body = (
         f"--{boundary}\r\n"
@@ -62,7 +67,10 @@ def test_each_submission_gets_a_distinct_id(client: TestClient) -> None:
 
 
 def test_repeated_field_names_are_all_counted(client: TestClient) -> None:
-    """Checkbox groups submit one name several times; no value may be dropped."""
+    """
+    checkbox groups submit one name several times, so no value may be dropped
+    :param client: test client for an app on default settings
+    """
     response = client.post(ENDPOINT, data={"topic": ["billing", "api", "docs"], "email": "a@b.co"})
 
     assert response.status_code == 202
@@ -70,7 +78,10 @@ def test_repeated_field_names_are_all_counted(client: TestClient) -> None:
 
 
 def test_accepts_a_field_with_an_empty_value(client: TestClient) -> None:
-    """An optional text input that the user left blank is still a submitted field."""
+    """
+    an optional text input that the user left blank is still a submitted field
+    :param client: test client for an app on default settings
+    """
     response = client.post(ENDPOINT, content=b"nickname=", headers=URLENCODED_HEADERS)
 
     assert response.status_code == 202
@@ -95,7 +106,10 @@ def test_content_type_parameters_and_casing_are_ignored(client: TestClient) -> N
 
 
 def test_does_not_echo_submitted_values(client: TestClient) -> None:
-    """The acknowledgement is metadata only; user input is not reflected back."""
+    """
+    the acknowledgement is metadata only, so user input is not reflected back
+    :param client: test client for an app on default settings
+    """
     response = client.post(ENDPOINT, data={"secret": "hunter2"})
 
     assert "hunter2" not in response.text

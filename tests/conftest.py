@@ -1,4 +1,5 @@
-"""Shared test fixtures.
+"""
+shared test fixtures
 
 Tests build their own application instances so that limits can be lowered to
 values that are cheap to exercise, and so that a developer's local environment
@@ -24,30 +25,47 @@ ClientFactory = Callable[..., TestClient]
 
 
 class IsolatedSettings(Settings):
-    """Settings that ignore a local ``.env``, so a developer's file cannot skew a run."""
+    """
+    settings that ignore a local ``.env``, so a developer's file cannot skew a run
+    """
 
     model_config = SettingsConfigDict(env_file=None)
 
 
 @pytest.fixture(autouse=True)
 def _ignore_ambient_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Hide any ``FORMS_*`` variables the developer happens to have exported."""
+    """
+    hide any ``FORMS_*`` variables the developer happens to have exported
+    :param monkeypatch: pytest fixture used to remove the variables for one test
+    """
     for name in list(os.environ):
         if name.startswith("FORMS_"):
             monkeypatch.delenv(name)
 
 
 def build_settings(**overrides: int) -> Settings:
-    """Build settings from defaults and explicit overrides only."""
+    """
+    build settings from defaults and explicit overrides only
+    :param overrides: setting values to replace the built-in defaults
+    :returns: settings that ignore the ambient environment
+    """
     return IsolatedSettings(**overrides)
 
 
 @pytest.fixture
 def make_client() -> Iterator[ClientFactory]:
-    """Return a factory for clients bound to an app with the given setting overrides."""
+    """
+    provide a factory for clients bound to an app with the given setting overrides
+    :returns: a factory that accepts setting overrides and returns a test client
+    """
     with ExitStack() as stack:
 
         def factory(**overrides: int) -> TestClient:
+            """
+            build a client for an app configured with the given overrides
+            :param overrides: setting values to replace the built-in defaults
+            :returns: a test client closed when the fixture tears down
+            """
             return stack.enter_context(TestClient(create_app(build_settings(**overrides))))
 
         yield factory
@@ -55,5 +73,9 @@ def make_client() -> Iterator[ClientFactory]:
 
 @pytest.fixture
 def client(make_client: ClientFactory) -> TestClient:
-    """A client for an application running on default settings."""
+    """
+    provide a client for an application running on default settings
+    :param make_client: factory for clients bound to a configured app
+    :returns: a test client for an app on default settings
+    """
     return make_client()

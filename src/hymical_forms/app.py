@@ -1,4 +1,6 @@
-"""Application assembly."""
+"""
+application assembly
+"""
 
 from __future__ import annotations
 
@@ -20,12 +22,14 @@ validated and acknowledged, but not stored or delivered anywhere.
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    """Build a Hymical Forms application.
-
-    Settings are attached to ``app.state`` rather than read from a module-level
-    singleton, so a test (or a future multi-tenant host) can run several
-    differently configured applications in one process.
     """
+    build a hymical forms application
+    :param settings: configuration to use, or None to load it from the environment
+    :returns: the configured FastAPI application
+    """
+    # Settings are attached to ``app.state`` rather than read from a module-level
+    # singleton, so a test (or a future multi-tenant host) can run several
+    # differently configured applications in one process.
     settings = settings or Settings()
 
     app = FastAPI(

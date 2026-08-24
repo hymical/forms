@@ -7,7 +7,7 @@ Reliable form ingestion and webhook delivery for developers.
 Every project with a contact form, a waitlist, or a feedback box ends up needing
 the same small backend: something that accepts an HTML form POST, validates it,
 stores it, and forwards it somewhere useful. Writing that once is easy; running
-it reliably — with retries, delivery logs, spam handling and retention rules —
+it reliably, with retries, delivery logs, spam handling and retention rules,
 is not. Hymical Forms is intended to be that backend, self-hostable and
 open-source.
 
@@ -15,7 +15,7 @@ open-source.
 
 **Early development.** This build implements the ingestion boundary only.
 
-A submission is parsed, validated and acknowledged — and then discarded.
+A submission is parsed, validated and acknowledged, and then discarded.
 Nothing is persisted and nothing is delivered anywhere. There is no
 authentication, no rate limiting, and no spam protection, so do not expose this
 to the public internet.
@@ -68,8 +68,8 @@ so there is nothing that readiness could report separately.
 
 Accepts a form submission.
 
-**Endpoint IDs** are 3–64 characters of lowercase ASCII letters, digits, `-` and
-`_`, and must start and end with a letter or digit. There is no endpoint
+**Endpoint IDs** are 3 to 64 characters of lowercase ASCII letters, digits, `-`
+and `_`, and must start and end with a letter or digit. There is no endpoint
 registry yet, so any syntactically valid ID is addressable; a malformed one is
 rejected with `404 invalid_endpoint_id`.
 
@@ -78,8 +78,8 @@ rejected with `404 invalid_endpoint_id`.
 unchanged. File uploads are not: a multipart part carrying a file is rejected
 rather than silently dropped. Anything else is rejected with `415`.
 
-**Repeated field names** — checkbox groups, multi-selects — are preserved in
-order. No submitted value is discarded.
+**Repeated field names**, such as checkbox groups and multi-selects, are
+preserved in order. No submitted value is discarded.
 
 A successful request returns `202 Accepted`. The status is deliberately not
 `201`: the submission is acknowledged as received and well-formed, but nothing
@@ -94,7 +94,7 @@ was created, stored or delivered.
 }
 ```
 
-Submitted values are not echoed back — the client already has them.
+Submitted values are not echoed back, because the client already has them.
 
 ### Try it
 

@@ -1,4 +1,6 @@
-"""Health endpoint."""
+"""
+health endpoint
+"""
 
 from __future__ import annotations
 
@@ -13,7 +15,9 @@ router = APIRouter(tags=["health"])
 
 
 class HealthResponse(BaseModel):
-    """Liveness report for a Hymical Forms process."""
+    """
+    liveness report for a hymical forms process
+    """
 
     status: Literal["ok"]
     service: str
@@ -22,10 +26,11 @@ class HealthResponse(BaseModel):
 
 @router.get("/health", summary="Report process health")
 async def health() -> HealthResponse:
-    """Report that the API process is running and able to serve requests.
-
-    This is a liveness signal only. Hymical Forms has no external dependencies
-    yet, so there is nothing to distinguish readiness from liveness; a separate
-    readiness endpoint will arrive with persistence.
     """
+    report that the api process is running and able to serve requests
+    :returns: a liveness payload naming the service and its version
+    """
+    # This is a liveness signal only. Hymical Forms has no external dependencies
+    # yet, so there is nothing to distinguish readiness from liveness; a separate
+    # readiness endpoint will arrive with persistence.
     return HealthResponse(status="ok", service="hymical-forms", version=__version__)

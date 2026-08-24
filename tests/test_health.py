@@ -1,4 +1,6 @@
-"""Health endpoint behaviour."""
+"""
+health endpoint behaviour
+"""
 
 from __future__ import annotations
 

@@ -1,4 +1,6 @@
-"""Limits that protect the ingestion boundary."""
+"""
+limits that protect the ingestion boundary
+"""
 
 from __future__ import annotations
 
@@ -10,7 +12,11 @@ ENDPOINT = "/f/contact-form"
 
 
 def _chunks(*parts: bytes) -> Iterator[bytes]:
-    """Yield a body in pieces so the client streams it without a Content-Length."""
+    """
+    yield a body in pieces so the client streams it without a Content-Length
+    :param parts: body fragments to send in order
+    :returns: an iterator over the fragments
+    """
     yield from parts
 
 
@@ -26,7 +32,10 @@ def test_rejects_a_body_larger_than_the_declared_limit(make_client: ClientFactor
 
 
 def test_rejects_an_oversized_streamed_body(make_client: ClientFactory) -> None:
-    """A chunked request cannot escape the limit by omitting Content-Length."""
+    """
+    a chunked request cannot escape the limit by omitting Content-Length
+    :param make_client: factory for clients bound to a configured app
+    """
     client = make_client(max_body_bytes=64)
 
     response = client.post(
@@ -125,7 +134,10 @@ def test_rejects_a_null_byte_in_a_field_value(make_client: ClientFactory) -> Non
 
 
 def test_allows_newlines_inside_a_textarea_value(make_client: ClientFactory) -> None:
-    """Multi-line textarea input is legitimate and must not trip the name rules."""
+    """
+    multi-line textarea input is legitimate and must not trip the name rules
+    :param make_client: factory for clients bound to a configured app
+    """
     client = make_client()
 
     response = client.post(ENDPOINT, data={"message": "line one\r\nline two"})

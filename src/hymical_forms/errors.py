@@ -1,7 +1,8 @@
-"""The single JSON error envelope used by every non-2xx response.
+"""
+the single JSON error envelope used by every non-2xx response
 
-Every error the API can produce — raised by our own code, by FastAPI's request
-validation, or by Starlette's routing — is rendered as::
+Every error the API can produce, whether raised by our own code, by FastAPI's
+request validation, or by Starlette's routing, is rendered as::
 
     {"error": {"code": "...", "message": "...", "details": {...}}}
 
@@ -27,7 +28,9 @@ from hymical_forms.ingestion import SubmissionRejected
 
 
 class ErrorDetail(BaseModel):
-    """The body of an error response."""
+    """
+    the body of an error response
+    """
 
     code: str = Field(description="Stable, machine-readable error identifier.")
     message: str = Field(description="Human-readable explanation of the failure.")
@@ -38,27 +41,38 @@ class ErrorDetail(BaseModel):
 
 
 class ErrorResponse(BaseModel):
-    """The envelope returned for every error."""
+    """
+    the envelope returned for every error
+    """
 
     error: ErrorDetail
 
 
 class ApiError(Exception):
-    """An error that maps directly onto the public error envelope.
-
-    Subclasses fix ``status_code`` and ``code``; instances supply the message and
-    any structured details.
+    """
+    an error that maps directly onto the public error envelope
     """
 
+    # Subclasses fix ``status_code`` and ``code``; instances supply the message
+    # and any structured details.
     status_code: ClassVar[int] = 500
     code: ClassVar[str] = "internal_error"
 
     def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
+        """
+        record the message and context for an error response
+        :param message: human-readable explanation of the failure
+        :param details: optional structured context, such as the limit that was exceeded
+        """
         super().__init__(message)
         self.message = message
         self.details = details
 
     def as_response(self) -> JSONResponse:
+        """
+        render this error in the shared envelope
+        :returns: a JSONResponse carrying the envelope and this error's status code
+        """
         return error_response(
             status_code=self.status_code,
             code=self.code,
@@ -74,13 +88,23 @@ def error_response(
     message: str,
     details: dict[str, Any] | None = None,
 ) -> JSONResponse:
-    """Build a JSON response in the standard error envelope."""
+    """
+    build a JSON response in the standard error envelope
+    :param status_code: HTTP status code to return
+    :param code: stable, machine-readable error identifier
+    :param message: human-readable explanation of the failure
+    :param details: optional structured context, omitted from the body when absent
+    :returns: a JSONResponse carrying the envelope
+    """
     payload = ErrorResponse(error=ErrorDetail(code=code, message=message, details=details))
     return JSONResponse(status_code=status_code, content=payload.model_dump(exclude_none=True))
 
 
 def register_exception_handlers(app: FastAPI) -> None:
-    """Route every error class the app can raise through the shared envelope."""
+    """
+    route every error class the app can raise through the shared envelope
+    :param app: the application to register the handlers on
+    """
     app.add_exception_handler(ApiError, _handle_api_error)
     app.add_exception_handler(SubmissionRejected, _handle_submission_rejected)
     app.add_exception_handler(StarletteHTTPException, _handle_http_exception)
@@ -93,16 +117,25 @@ def register_exception_handlers(app: FastAPI) -> None:
 
 
 async def _handle_api_error(request: Request, exc: Exception) -> Response:
+    """
+    render an error raised by our own HTTP layer
+    :param request: the request being handled
+    :param exc: the raised exception, always an ApiError
+    :returns: the envelope response
+    """
     assert isinstance(exc, ApiError)
     return exc.as_response()
 
 
 async def _handle_submission_rejected(request: Request, exc: Exception) -> Response:
-    """Render a domain rejection.
-
-    Every ingestion rule failure is a well-formed request carrying an
-    unacceptable submission, which is exactly what 422 describes.
     """
+    render a domain rejection
+    :param request: the request being handled
+    :param exc: the raised exception, always a SubmissionRejected
+    :returns: the envelope response, with a 422 status
+    """
+    # Every ingestion rule failure is a well-formed request carrying an
+    # unacceptable submission, which is exactly what 422 describes.
     assert isinstance(exc, SubmissionRejected)
     return error_response(
         status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
@@ -113,7 +146,12 @@ async def _handle_submission_rejected(request: Request, exc: Exception) -> Respo
 
 
 async def _handle_http_exception(request: Request, exc: Exception) -> Response:
-    """Render routing-level errors (unknown paths, wrong methods) in the envelope."""
+    """
+    render routing-level errors such as unknown paths and wrong methods
+    :param request: the request being handled
+    :param exc: the raised exception, always a Starlette HTTPException
+    :returns: the envelope response
+    """
     assert isinstance(exc, StarletteHTTPException)
     return error_response(
         status_code=exc.status_code,
@@ -123,6 +161,12 @@ async def _handle_http_exception(request: Request, exc: Exception) -> Response:
 
 
 async def _handle_request_validation_error(request: Request, exc: Exception) -> Response:
+    """
+    render a request that FastAPI could not validate
+    :param request: the request being handled
+    :param exc: the raised exception, always a RequestValidationError
+    :returns: the envelope response, with a 422 status
+    """
     assert isinstance(exc, RequestValidationError)
     return error_response(
         status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
@@ -132,7 +176,12 @@ async def _handle_request_validation_error(request: Request, exc: Exception) -> 
 
 
 async def _handle_unexpected_error(request: Request, exc: Exception) -> Response:
-    """Return an opaque 500 rather than letting an internal error reach the client."""
+    """
+    return an opaque 500 rather than letting an internal error reach the client
+    :param request: the request being handled
+    :param exc: the unhandled exception, deliberately not described to the client
+    :returns: the envelope response, with a 500 status
+    """
     return error_response(
         status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         code="internal_error",
@@ -141,7 +190,11 @@ async def _handle_unexpected_error(request: Request, exc: Exception) -> Response
 
 
 def _code_for_status(status_code: int) -> str:
-    """Derive an error code from a status code, e.g. 405 -> ``method_not_allowed``."""
+    """
+    derive an error code from a status code, so that 405 gives ``method_not_allowed``
+    :param status_code: HTTP status code to name
+    :returns: the status phrase in snake case, or ``http_error`` if unrecognised
+    """
     try:
         phrase = HTTPStatus(status_code).phrase
     except ValueError:

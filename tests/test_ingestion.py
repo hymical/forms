@@ -1,4 +1,5 @@
-"""The internal submission representation.
+"""
+the internal submission representation
 
 These tests pin the shape the rest of the system will eventually persist and
 deliver, which the HTTP acknowledgement only summarises.

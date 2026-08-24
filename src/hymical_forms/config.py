@@ -1,8 +1,8 @@
-"""Application settings.
+"""
+application settings, read from ``FORMS_``-prefixed environment variables
 
-Every setting is read from a ``FORMS_``-prefixed environment variable (or a local
-``.env`` file). Settings are added only when the code actually uses them, so this
-model is currently limited to the ingestion boundary's protective limits.
+Settings are added only when the code actually uses them, so this model is
+currently limited to the ingestion boundary's protective limits.
 """
 
 from __future__ import annotations
@@ -12,7 +12,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Runtime configuration for a Hymical Forms process."""
+    """
+    runtime configuration for a hymical forms process
+    """
 
     model_config = SettingsConfigDict(
         env_prefix="FORMS_",

@@ -1,4 +1,6 @@
-"""The shared error envelope."""
+"""
+the shared error envelope
+"""
 
 from __future__ import annotations
 
@@ -73,7 +75,10 @@ def test_rejects_a_multipart_body_that_does_not_match_its_boundary(client: TestC
 
 
 def test_rejects_file_uploads(client: TestClient) -> None:
-    """File handling is out of scope, so a file part is refused rather than ignored."""
+    """
+    file handling is out of scope, so a file part is refused rather than ignored
+    :param client: test client for an app on default settings
+    """
     response = client.post(
         ENDPOINT,
         data={"email": "dev@example.com"},
@@ -105,6 +110,9 @@ def test_unexpected_errors_do_not_leak_internals() -> None:
 
     @app.get("/boom")
     async def boom() -> None:
+        """
+        raise an error carrying a secret, to prove the handler does not relay it
+        """
         raise RuntimeError("connection string: postgres://user:pa55w0rd@db/forms")
 
     with TestClient(app, raise_server_exceptions=False) as client:

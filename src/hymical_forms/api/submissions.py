@@ -1,4 +1,6 @@
-"""Form ingestion endpoint: ``POST /f/{endpoint_id}``."""
+"""
+form ingestion endpoint: ``POST /f/{endpoint_id}``
+"""
 
 from __future__ import annotations
 
@@ -33,12 +35,17 @@ router = APIRouter(tags=["submissions"])
 
 
 class InvalidEndpointId(ApiError):
-    """The path segment is not a well-formed endpoint identifier."""
+    """
+    raised when the path segment is not a well-formed endpoint identifier
+    """
 
     status_code = HTTPStatus.NOT_FOUND
     code = "invalid_endpoint_id"
 
     def __init__(self) -> None:
+        """
+        state the endpoint identifier rules the request failed
+        """
         super().__init__(
             "The path does not address a form endpoint. Endpoint IDs are "
             f"{ENDPOINT_ID_MIN_LENGTH}-{ENDPOINT_ID_MAX_LENGTH} characters using lowercase "
@@ -47,12 +54,18 @@ class InvalidEndpointId(ApiError):
 
 
 class UnsupportedMediaType(ApiError):
-    """The request used a content type the ingestion endpoint cannot parse."""
+    """
+    raised when the request used a content type the endpoint cannot parse
+    """
 
     status_code = HTTPStatus.UNSUPPORTED_MEDIA_TYPE
     code = "unsupported_media_type"
 
     def __init__(self, received: str) -> None:
+        """
+        report the rejected content type alongside the supported ones
+        :param received: the normalized media type taken from the request
+        """
         super().__init__(
             f"Form submissions must be sent as {URLENCODED} or {MULTIPART}.",
             details={
@@ -63,12 +76,18 @@ class UnsupportedMediaType(ApiError):
 
 
 class MalformedFormBody(ApiError):
-    """The body did not parse as the declared form content type."""
+    """
+    raised when the body did not parse as the declared form content type
+    """
 
     status_code = HTTPStatus.BAD_REQUEST
     code = "malformed_form_body"
 
     def __init__(self, reason: str) -> None:
+        """
+        report why the body could not be parsed
+        :param reason: the form parser's description of what went wrong
+        """
         super().__init__(
             "The request body could not be parsed as form data.",
             details={"reason": reason},
@@ -76,12 +95,18 @@ class MalformedFormBody(ApiError):
 
 
 class FileUploadNotSupported(ApiError):
-    """A multipart part carried a file, which this service does not accept."""
+    """
+    raised when a multipart part carries a file, which this service does not accept
+    """
 
     status_code = HTTPStatus.UNPROCESSABLE_ENTITY
     code = "file_upload_not_supported"
 
     def __init__(self, field_name: str) -> None:
+        """
+        name the field that carried a file part
+        :param field_name: name of the offending multipart field
+        """
         super().__init__(
             f"Field {field_name!r} carries a file upload, which is not supported.",
             details={"field": field_name},
@@ -89,12 +114,12 @@ class FileUploadNotSupported(ApiError):
 
 
 class SubmissionAccepted(BaseModel):
-    """Acknowledgement returned for an accepted submission.
-
-    The submitted values are not echoed back: the client already has them, and
-    reflecting user input adds nothing but risk.
+    """
+    acknowledgement returned for an accepted submission
     """
 
+    # The submitted values are not echoed back: the client already has them, and
+    # reflecting user input adds nothing but risk.
     submission_id: str = Field(description="Opaque identifier generated for this submission.")
     endpoint_id: str = Field(description="The endpoint the submission was addressed to.")
     received_at: datetime = Field(description="UTC timestamp of when the API accepted the body.")
@@ -114,12 +139,15 @@ class SubmissionAccepted(BaseModel):
     },
 )
 async def submit(endpoint_id: str, request: Request) -> SubmissionAccepted:
-    """Accept an HTML form submission.
-
-    The response is ``202 Accepted`` rather than ``201 Created``: the submission
-    is acknowledged as received and well-formed, but Hymical Forms does not yet
-    persist it or deliver it anywhere.
     """
+    accept an html form submission
+    :param endpoint_id: endpoint identifier taken from the request path
+    :param request: the incoming request, read for its content type and body
+    :returns: an acknowledgement carrying the generated submission metadata
+    """
+    # The response is 202 Accepted rather than 201 Created: the submission is
+    # acknowledged as received and well-formed, but Hymical Forms does not yet
+    # persist it or deliver it anywhere.
     if not is_valid_endpoint_id(endpoint_id):
         raise InvalidEndpointId()
 
@@ -147,16 +175,22 @@ async def submit(endpoint_id: str, request: Request) -> SubmissionAccepted:
 async def _parse_form(
     request: Request, media_type: str, settings: Settings
 ) -> list[tuple[str, str]]:
-    """Parse the body into ordered name/value pairs, preserving repeated names.
-
-    The parser is selected from the media type we normalized ourselves rather
-    than through ``Request.form()``, whose dispatch compares the header verbatim
-    even though media types are case-insensitive (RFC 9110 §8.3).
-
-    Starlette's own field and part limits are disabled: the request body size cap
-    already bounds memory use, and leaving them on would let a library-defined
-    threshold shadow the limits configured for this service.
     """
+    parse the body into ordered name/value pairs, preserving repeated names
+    :param request: the incoming request, streamed into the form parser
+    :param media_type: normalized media type taken from the Content-Type header
+    :param settings: active configuration, used to size the parser buffers
+    :returns: ordered name/value pairs exactly as submitted
+    :raises MalformedFormBody: if the body does not parse as the declared media type
+    :raises FileUploadNotSupported: if a multipart part carries a file
+    """
+    # The parser is selected from the media type we normalized ourselves rather
+    # than through ``Request.form()``, whose dispatch compares the header verbatim
+    # even though media types are case-insensitive (RFC 9110 section 8.3).
+    #
+    # Starlette's own field and part limits are disabled: the request body size cap
+    # already bounds memory use, and leaving them on would let a library-defined
+    # threshold shadow the limits configured for this service.
     parser: FormParser | MultiPartParser
     if media_type == MULTIPART:
         parser = MultiPartParser(
@@ -191,11 +225,20 @@ async def _parse_form(
 
 
 def _failure_reason(exc: MultiPartException | ParseError) -> str:
+    """
+    extract a human-readable reason from a form parser failure
+    :param exc: the exception raised while parsing the body
+    :returns: the parser's description of what went wrong
+    """
     return exc.message if isinstance(exc, MultiPartException) else str(exc)
 
 
 def _media_type(content_type: str | None) -> str:
-    """Strip parameters such as ``charset`` and ``boundary`` from a Content-Type."""
+    """
+    strip parameters such as charset and boundary from a Content-Type header
+    :param content_type: raw header value, or None when the header is absent
+    :returns: the lowercased media type, or an empty string when there is none
+    """
     if not content_type:
         return ""
     return content_type.split(";", 1)[0].strip().lower()

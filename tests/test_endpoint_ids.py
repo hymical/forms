@@ -1,7 +1,8 @@
-"""Endpoint identifier rules.
+"""
+endpoint identifier rules
 
-An endpoint ID is 3-64 characters of lowercase ASCII letters, digits, ``-`` and
-``_``, and must start and end with a letter or digit.
+An endpoint ID is 3 to 64 characters of lowercase ASCII letters, digits, ``-``
+and ``_``, and must start and end with a letter or digit.
 """
 
 from __future__ import annotations

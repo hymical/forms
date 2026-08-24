@@ -1,4 +1,5 @@
-"""ASGI entrypoint.
+"""
+the ASGI entrypoint
 
 Run with::
 
