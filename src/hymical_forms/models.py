@@ -1,5 +1,6 @@
 """
-the persisted schema: endpoints and the submissions addressed to them
+the persisted schema: endpoints, the submissions addressed to them, and the
+management credentials that administer the service
 """
 
 from __future__ import annotations
@@ -19,6 +20,12 @@ from sqlalchemy import (
 from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from hymical_forms.apikeys import (
+    DISPLAY_PREFIX_LENGTH,
+    KEY_DIGEST_LENGTH,
+    MANAGEMENT_KEY_ID_MAX_LENGTH,
+    MANAGEMENT_KEY_NAME_MAX_LENGTH,
+)
 from hymical_forms.ingestion import (
     ENDPOINT_ID_MAX_LENGTH,
     IDEMPOTENCY_KEY_MAX_LENGTH,
@@ -324,3 +331,53 @@ class DeliveryAttempt(Base):
     # Response bodies are deliberately not stored. They are unbounded, written by
     # somebody else's server, and nothing in this build reads them back.
     error: Mapped[str | None] = mapped_column(String(DELIVERY_ERROR_MAX_LENGTH), default=None)
+
+
+class ManagementApiKey(Base):
+    """
+    a credential that authenticates management requests against this service
+    """
+
+    # These keys administer the whole service. There is no account, tenant or
+    # role model to attach them to, and inventing owner columns for one would be
+    # guessing at a design nothing has asked for yet. Endpoints deliberately do
+    # not record which key created them for the same reason.
+    __tablename__ = "management_api_keys"
+
+    __table_args__ = (
+        # Authentication resolves a candidate by digest, so this constraint is
+        # both the uniqueness guarantee and the index that lookup rides on.
+        UniqueConstraint("key_digest", name="uq_management_api_keys_key_digest"),
+    )
+
+    id: Mapped[str] = mapped_column(String(MANAGEMENT_KEY_ID_MAX_LENGTH), primary_key=True)
+    name: Mapped[str] = mapped_column(String(MANAGEMENT_KEY_NAME_MAX_LENGTH))
+
+    # The prefix and the first few characters of the secret, so an operator can
+    # tell two credentials apart in a listing. Everything after it is missing,
+    # which is what makes the fragment safe to display and to log.
+    display_prefix: Mapped[str] = mapped_column(String(DISPLAY_PREFIX_LENGTH))
+
+    # The only representation of the credential this service keeps. The key
+    # itself is never written anywhere: whoever creates one either saves it at
+    # that moment or makes another.
+    key_digest: Mapped[str] = mapped_column(String(KEY_DIGEST_LENGTH))
+
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+
+    # Revocation sets a timestamp rather than deleting the row, so the identity
+    # and the history of a withdrawn credential survive being withdrawn.
+    revoked_at: Mapped[datetime | None] = mapped_column(UtcDateTime, default=None)
+
+    # Best-effort telemetry, written after a request has already authenticated.
+    # Nothing decides anything on it, which is what lets a failure to update it
+    # be ignored rather than turning a valid key into a rejected one.
+    last_used_at: Mapped[datetime | None] = mapped_column(UtcDateTime, default=None)
+
+    @property
+    def is_active(self) -> bool:
+        """
+        report whether this key still authenticates
+        :returns: True if the key has not been revoked
+        """
+        return self.revoked_at is None

@@ -42,9 +42,10 @@ open-source.
 sent to them together with the durable obligation to deliver them, and runs a
 separate worker that performs the signed webhook delivery and retries it.
 
-Endpoint and webhook configuration is completely unauthenticated: anyone who can
-reach the API can create an endpoint pointing anywhere. There is no rate limiting
-and no spam protection, so do not expose this to the public internet.
+Endpoint configuration now requires a management API key. Form ingestion stays
+public, because an ingestion URL is meant to sit in the `action` attribute of
+somebody's HTML form. There is still no rate limiting and no spam protection,
+so a public deployment is exposed to whatever volume the internet sends it.
 
 | Capability                    | Status                    |
 | ----------------------------- | ------------------------- |
@@ -58,7 +59,7 @@ and no spam protection, so do not expose this to the public internet.
 | Durable delivery queue        | Implemented               |
 | Retries with backoff          | Implemented               |
 | Schema migrations             | Implemented               |
-| API keys / authentication     | **Not implemented**       |
+| API keys / authentication     | Implemented               |
 | Manual delivery replay        | **Not implemented**       |
 | Rate limiting, spam handling  | **Not implemented**       |
 | Export, retention, dashboards | **Not implemented**       |
@@ -98,11 +99,15 @@ See [`.env.example`](.env.example) for every setting and its default.
 
 ## Run
 
-Hymical Forms is two processes sharing one database. Migrate it first, then
-start them:
+Hymical Forms is two processes sharing one database. Migrate it first, create a
+management API key, then start them:
 
 ```bash
 alembic upgrade head
+```
+
+```bash
+python -m hymical_forms.cli create-key --name local-admin
 ```
 
 ```bash
@@ -203,6 +208,120 @@ build rather than surfacing in production.
 
 Interactive API documentation is served at `http://127.0.0.1:8000/docs`.
 
+## Management API keys
+
+Administering the service needs a credential. Submitting a form does not.
+
+| Route                  | Credential                       |
+| ---------------------- | -------------------------------- |
+| `POST /endpoints`      | Management API key required      |
+| `POST /f/{endpoint_id}`| **Public**, no credential        |
+| `GET /health`          | **Public**, no credential        |
+
+A management API key is an opaque bearer token that administers the whole
+service. It is not a user account, not a login, and not scoped to a tenant:
+there are no users, accounts, organizations, roles or permissions in this build,
+and every valid key can do everything a management key can do. It is also
+completely separate from a webhook signing secret. A `whsec_...` secret proves
+to *your* server that a delivery came from Hymical Forms; a `hym_live_...` key
+proves to Hymical Forms that a management request came from you. Neither can be
+used in place of the other.
+
+### Creating the first key
+
+Keys are created against the database with the operator CLI, never over HTTP.
+A route that issued a management credential without needing one would be an
+unauthenticated way to gain full management access, which is the thing this
+boundary exists to remove. Nothing is generated at startup, and no key ships
+with this repository.
+
+```bash
+python -m hymical_forms.cli create-key --name local-admin
+```
+
+```
+Created management API key mk_634c4efc22fb40fab4b19b82202b23bb (local-admin).
+
+    hym_live_EXAMPLEONLYNOTAREALKEYREPLACETHISWITHYOURS
+
+Save this key now. It is shown here and nowhere else: the server stores
+only a digest of it and cannot show it again. If you lose it, create a
+replacement and revoke this one by its key ID.
+```
+
+> **Save the key now.** That line is the only time it is ever displayed. The
+> server stores a SHA-256 digest of it and nothing else, so there is no command,
+> route or database query that can show it to you again. Losing a key means
+> creating another one and revoking the old one by its key ID, which `list-keys`
+> can still tell you.
+
+The command reads `FORMS_DATABASE_URL`, the same setting everything else reads,
+and refuses to run against a database that is not at the migration revision this
+build expects.
+
+**A key is not configuration.** There is no `FORMS_API_KEY` variable, and there
+should not be: keys live in the database so they can be created and revoked
+without restarting anything, and so revoking one takes effect on the very next
+request rather than on the next deploy.
+
+### Authenticating a management request
+
+```bash
+curl -X POST http://127.0.0.1:8000/endpoints \
+  -H 'Authorization: Bearer hym_live_REPLACE_WITH_YOUR_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"id": "contact-form", "name": "Contact form"}'
+```
+
+The `Bearer` scheme is required. Credentials are never accepted in a query
+parameter, where they would end up in access logs, browser history and
+`Referer` headers.
+
+### Listing keys
+
+```bash
+python -m hymical_forms.cli list-keys
+```
+
+```
+KEY ID                               NAME         PREFIX             CREATED                    LAST USED  STATUS
+mk_634c4efc22fb40fab4b19b82202b23bb  local-admin  hym_live_EXAMPLE1  2026-08-24T22:53:28+00:00  never      active
+```
+
+Only what the database holds, which is no credential. `PREFIX` is the first few
+characters of the key, kept so that you can tell two credentials apart in this
+listing and match one against the key you saved. There is no HTTP route that
+lists keys.
+
+### Revoking a key
+
+```bash
+python -m hymical_forms.cli revoke-key mk_634c4efc22fb40fab4b19b82202b23bb
+```
+
+The key stops authenticating on the next request. Nothing caches a credential,
+so revocation is immediate rather than eventual. The row is not deleted: it
+keeps the key's identity, when it was created, when it was last used and when it
+was withdrawn, which is what makes a revoked key still explainable later.
+Revoking twice is accepted and reports the moment the key actually stopped
+working. Rotation beyond create plus revoke is not implemented: to rotate,
+create a new key, move your callers onto it, then revoke the old one.
+
+### Key format
+
+A key is `hym_live_` followed by 32 random bytes from the operating system,
+rendered as unpadded base64url: 43 characters, 256 bits of entropy. The prefix
+is there so an operator who finds the string in a config file knows immediately
+whose credential it is and what to revoke.
+
+Only a hex SHA-256 digest of the whole key is stored, and lookup is by that
+digest, so authentication is one indexed read. Password-style slow hashing is
+deliberately not used: it exists because passwords are low-entropy and guessable,
+and it would only add latency to every management request here. There is no
+server-side pepper either, for the same reason: a pepper protects a digest that
+is feasible to attack offline, which a 256-bit random secret is not, and it would
+add a second secret whose loss would silently invalidate every key in the table.
+
 ## API
 
 ### `GET /health`
@@ -222,11 +341,14 @@ deciding whether to restart the process.
 Registers a form endpoint. Submissions are only accepted for endpoints that
 exist here.
 
-**This route is unauthenticated.** Authentication is deliberately out of scope
-for now, so keep the service on a private network.
+**This route requires a management API key.** See
+[Management API keys](#management-api-keys) for how to create one. A request
+without a usable one is refused with `401 authentication_required`, and one
+carrying a credential that does not authenticate with `401 invalid_api_key`.
 
 ```bash
 curl -X POST http://127.0.0.1:8000/endpoints \
+  -H 'Authorization: Bearer hym_live_REPLACE_WITH_YOUR_KEY' \
   -H 'Content-Type: application/json' \
   -d '{"id": "contact-form", "name": "Contact form",
        "webhook_url": "https://example.com/hooks/forms"}'
@@ -266,9 +388,18 @@ Reusing an ID returns `409 endpoint_already_exists`. There is no route to list,
 update or delete endpoints yet, so a webhook can only be configured at creation
 time.
 
+The key that created an endpoint is not recorded on it. A management key
+administers the service rather than owning a slice of it, and there is no
+tenancy model for an owner column to belong to.
+
 ### `POST /f/{endpoint_id}`
 
 Accepts a form submission for a registered endpoint and stores it.
+
+**This route is public and stays public.** It is the URL that goes in the
+`action` attribute of an HTML form, so it cannot require a header a browser form
+has no way to send. No management credential is read here, and one sent anyway
+is ignored rather than forwarded anywhere.
 
 A submission to an ID that does not exist is rejected with
 `404 endpoint_not_found`, and one to an inactive endpoint with
@@ -348,9 +479,11 @@ as its submission is stored.
 accepts UUIDs, hex, base64 and base64url. Anything else is rejected with
 `400 invalid_idempotency_key`, including a header that is present but empty.
 
-The 16-character floor exists because keys are endpoint-scoped and this API is
-unauthenticated, so every client of an endpoint shares one key space. A short or
-predictable key would collide with a stranger's submission. Use a random value.
+The 16-character floor exists because keys are endpoint-scoped and form
+ingestion is public, so every client of an endpoint shares one key space. A short
+or predictable key would collide with a stranger's submission. Use a random
+value. Management API keys do not change this: they authenticate the endpoint's
+administrator, not the visitors submitting the form.
 
 ### Webhook delivery
 
@@ -513,10 +646,17 @@ Do not enable it in production.
 ### Try it
 
 ```bash
+python -m hymical_forms.cli create-key --name local-admin
+```
+
+```bash
 curl -X POST http://127.0.0.1:8000/endpoints \
+  -H 'Authorization: Bearer hym_live_REPLACE_WITH_YOUR_KEY' \
   -H 'Content-Type: application/json' \
   -d '{"id": "contact-form", "name": "Contact form"}'
 ```
+
+Submitting needs no credential at all:
 
 ```bash
 curl -i -X POST http://127.0.0.1:8000/f/contact-form -d email=dev@example.com -d message=hello
@@ -552,6 +692,8 @@ add.
 | ------ | -------------------------- | -------------------------------------------------------- |
 | 400    | `malformed_form_body`      | Body does not parse as the declared content type          |
 | 400    | `invalid_idempotency_key`  | `Idempotency-Key` header breaks the key format rules      |
+| 401    | `authentication_required`  | A management route was called without a bearer credential |
+| 401    | `invalid_api_key`          | The management API key is malformed, unknown or revoked   |
 | 404    | `invalid_endpoint_id`      | Submission path is not a well-formed endpoint ID          |
 | 404    | `endpoint_not_found`       | Endpoint ID is well formed but no such endpoint exists    |
 | 404    | `not_found`                | Unknown path                                              |
@@ -577,6 +719,13 @@ Ingestion rule codes are `too_many_fields`, `field_name_too_long`,
 from: `404` when it arrived as a submission path that addresses nothing, `422`
 when it arrived as a field in a request body.
 
+Both `401`s carry `WWW-Authenticate: Bearer`. They are deliberately `401` and
+not `403`: a `403` says the caller is known and not permitted, which needs a
+permission model this build does not have. `invalid_api_key` is one answer for
+malformed, unknown and revoked credentials alike, so that a guesser cannot sort
+their attempts into "nearly right" and "wrong". The credential a request sent is
+never echoed back in an error.
+
 ## Configuration
 
 All settings are read from `FORMS_`-prefixed environment variables, or from a
@@ -598,6 +747,11 @@ All settings are read from `FORMS_`-prefixed environment variables, or from a
 | `FORMS_WORKER_POLL_SECONDS`             | `1`     | How often an idle worker looks for work    |
 | `FORMS_WORKER_BATCH_SIZE`               | `10`    | Deliveries a worker claims at once         |
 | `FORMS_WORKER_LEASE_SECONDS`            | `60`    | How long a worker's claim holds            |
+
+There is deliberately no setting for a management API key. Keys live in the
+database so that creating and revoking one needs no restart, and so that a
+revoked key stops working on the very next request. See
+[Management API keys](#management-api-keys).
 
 ## Development
 
@@ -626,7 +780,11 @@ pytest tests/integration -m postgres
 ```
 
 One of those tests asserts that the migrations and the models describe the same
-schema, which is what keeps the fast suite's shortcut honest.
+schema, which is what keeps the fast suite's shortcut honest. Others upgrade a
+PostgreSQL database that already holds endpoints, submissions, deliveries and
+attempts, and check that the data is exactly what it was afterwards, that the
+downgrade removes only what the newer revision added, and that the data survives
+that too.
 
 CI runs the lint, format and type checks once, the fast suite across Python
 3.11 to 3.13, and the PostgreSQL suite once against a PostgreSQL 17 service.
@@ -636,6 +794,8 @@ CI runs the lint, format and type checks once, the fast suite across Python
 ```
 src/hymical_forms/
   app.py            application assembly and startup
+  apikeys.py        management key rules: format, generation, digesting
+  cli.py            the operator command line for management keys
   config.py         typed settings
   db.py             engine and session lifecycle
   errors.py         the shared JSON error envelope
@@ -649,15 +809,19 @@ src/hymical_forms/
   schema.py         the boundary between the application and Alembic
   main.py           ASGI entrypoint
   api/              HTTP routes and response models
+    security.py     the management authentication dependency
   migrations/       Alembic environment and revisions
 ```
 
-`ingestion.py` and `webhooks.py` hold the domain rules and know nothing about
-HTTP or the database. `models.py` and `storage.py` are the only modules that
-write queries, and `delivery.py` is the only one that makes an outbound request.
-`api/` translates requests into domain rules and storage calls, and their
-outcomes into responses. `worker.py` is a separate process and shares only the
-database with the API.
+`ingestion.py`, `webhooks.py` and `apikeys.py` hold the domain rules and know
+nothing about HTTP or the database. `models.py` and `storage.py` are the only
+modules that write queries, and `delivery.py` is the only one that makes an
+outbound request. `api/` translates requests into domain rules and storage calls,
+and their outcomes into responses. `api/security.py` holds the one authentication
+dependency every management route declares, so the rules cannot drift apart route
+by route. `worker.py` and `cli.py` are separate processes and share only the
+database with the API; the worker does not authenticate through the HTTP API at
+all.
 
 ### Storage notes
 
@@ -705,9 +869,11 @@ an expired lease becomes reclaimable by exactly one worker.
   successfully and dies before recording it will have its lease expire, and the
   next worker will deliver the same event again. Deduplicate on the submission
   `id` in the signed payload.
-- **Only one migration exists so far.** The upgrade path is real and tested, but
-  it has only ever been exercised from an empty database to the baseline. Nothing
-  has yet had to migrate data it cared about.
+- **There is no user, account or role model.** A management key administers the
+  whole service. Keys cannot be scoped to an endpoint, a tenant or a permission,
+  and every valid key can do everything a management key can do. Separate keys
+  are useful for revoking one caller without disturbing another, and for nothing
+  else yet.
 - **A failed delivery is final and cannot be replayed.** Once a delivery reaches
   `failed`, nothing retries it and there is no manual replay route.
 - **The lease must outlast a delivery attempt.** A batch is delivered
@@ -722,10 +888,19 @@ an expired lease becomes reclaimable by exactly one worker.
   and DNS rebinding is not addressed at all. Closing this properly means
   resolving at request time and pinning the connection to the validated address.
   Treat the current checks as a guardrail against mistakes, not a defence against
-  an attacker who can configure endpoints.
-- **No authentication.** Anyone who can reach the API can create an endpoint,
-  point its webhook anywhere, and post to any active one. There is no rate
-  limiting or spam protection.
+  an attacker who can configure endpoints. Authentication narrows who that is to
+  whoever holds a management key; it does not make the checks complete.
+- **Form ingestion is public and unrated.** Anyone who can reach the API can post
+  to any active endpoint. There is no rate limiting, no spam protection and no
+  CAPTCHA, so a public deployment accepts whatever volume it is sent.
+- **A lost management key cannot be recovered,** only replaced. The server holds
+  a digest and nothing else. Create a new key, move your callers onto it, and
+  revoke the old one by the key ID `list-keys` still shows.
+- **`last_used_at` is written on every authenticated management request.** That
+  is one extra small write per request, which management traffic is rare enough
+  to absorb and the ingestion path never pays because it is not authenticated. A
+  failure to write it is logged and ignored rather than allowed to turn a valid
+  credential into a `401`.
 - **A webhook can only be set when the endpoint is created.** There is no route
   to change a destination or rotate a signing secret.
 - **No API for delivery attempts.** They are recorded, but reading them means
@@ -743,13 +918,16 @@ an expired lease becomes reclaimable by exactly one worker.
 - **`multipart/form-data` bodies are buffered in memory,** bounded by
   `FORMS_MAX_BODY_BYTES`.
 - A rejected submission reveals whether an endpoint ID exists, which allows
-  enumeration. This is unavoidable while the API is unauthenticated.
+  enumeration. This is unavoidable while form ingestion is public, and it stays
+  true now that endpoint creation is not.
 - **Idempotency keys never expire.** A key stays spent for as long as its
   submission is stored, so the table only grows. Expiry belongs with retention.
 - **Idempotency keys are shared across all clients of an endpoint,** because
   there is nothing to scope them to yet. Guessing another client's key returns
   that submission's ID and timestamp, though never its contents. Random keys of
-  the required length make this impractical, and API keys will close it properly.
+  the required length make this impractical. Management API keys do not close
+  this: they authenticate whoever administers the endpoint, not the visitors
+  submitting the form, and the submission route stays public by design.
 - **A replay is only recognised once the first attempt has committed.** A retry
   sent while the original is still in flight is treated as a concurrent request,
   which is safe, but a retry sent after the original *failed* is a new

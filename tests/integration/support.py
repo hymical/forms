@@ -19,9 +19,10 @@ from sqlalchemy import Engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
-from hymical_forms import models
+from hymical_forms import apikeys, models, storage
 from hymical_forms.config import Settings
 from hymical_forms.db import create_engine_from_url
+from hymical_forms.models import utcnow
 from hymical_forms.webhooks import DeliveryState
 
 POSTGRES_URL_VARIABLE = "HYMICAL_TEST_POSTGRES_URL"
@@ -71,6 +72,26 @@ def drop_everything(engine: Engine) -> None:
     with engine.begin() as connection:
         connection.execute(text("DROP SCHEMA public CASCADE"))
         connection.execute(text("CREATE SCHEMA public"))
+
+
+def seed_management_key(session: Session, name: str = "integration-tests") -> str:
+    """
+    mint a management key into the database, the way the operator CLI does
+    :param session: the session to insert through
+    :param name: human-readable label for the key
+    :returns: the full credential, which exists only here and in the caller
+    """
+    generated = apikeys.new_management_key()
+    storage.create_management_key(
+        session,
+        key_id=generated.id,
+        name=name,
+        display_prefix=generated.display_prefix,
+        key_digest=generated.digest,
+        now=utcnow(),
+    )
+    session.commit()
+    return generated.key
 
 
 def seed_endpoint(session: Session, endpoint_id: str = "contact-form") -> models.Endpoint:

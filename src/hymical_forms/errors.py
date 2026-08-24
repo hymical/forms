@@ -54,10 +54,14 @@ class ApiError(Exception):
     an error that maps directly onto the public error envelope
     """
 
-    # Subclasses fix ``status_code`` and ``code``; instances supply the message
-    # and any structured details.
+    # Subclasses fix ``status_code``, ``code`` and any headers the status
+    # requires; instances supply the message and any structured details.
     status_code: ClassVar[int] = 500
     code: ClassVar[str] = "internal_error"
+
+    # Only for headers a status code is defined in terms of, such as the
+    # ``WWW-Authenticate`` an RFC 9110 401 is not a complete response without.
+    headers: ClassVar[dict[str, str] | None] = None
 
     def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
         """
@@ -79,6 +83,7 @@ class ApiError(Exception):
             code=self.code,
             message=self.message,
             details=self.details,
+            headers=self.headers,
         )
 
 
@@ -88,6 +93,7 @@ def error_response(
     code: str,
     message: str,
     details: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     """
     build a JSON response in the standard error envelope
@@ -95,10 +101,15 @@ def error_response(
     :param code: stable, machine-readable error identifier
     :param message: human-readable explanation of the failure
     :param details: optional structured context, omitted from the body when absent
+    :param headers: optional response headers the status code requires
     :returns: a JSONResponse carrying the envelope
     """
     payload = ErrorResponse(error=ErrorDetail(code=code, message=message, details=details))
-    return JSONResponse(status_code=status_code, content=payload.model_dump(exclude_none=True))
+    return JSONResponse(
+        status_code=status_code,
+        content=payload.model_dump(exclude_none=True),
+        headers=headers,
+    )
 
 
 def register_exception_handlers(app: FastAPI) -> None:
