@@ -280,7 +280,17 @@ class WebhookDelivery(Base):
     state: Mapped[str] = mapped_column(
         String(DELIVERY_STATE_MAX_LENGTH), default=DeliveryState.PENDING
     )
+
+    # Every request ever made for this delivery. It only ever goes up, which is
+    # what lets it number the attempt history without a number being reused.
     attempts: Mapped[int] = mapped_column(default=0)
+
+    # The requests made since this delivery last entered the queue. A manual
+    # replay resets this and nothing else, so a delivery that exhausted its
+    # allowance gets a whole fresh retry cycle rather than one last attempt,
+    # while the history it already has keeps its numbering. Until something is
+    # replayed the two counters are equal.
+    cycle_attempts: Mapped[int] = mapped_column(default=0)
 
     # When this delivery next becomes due. Indexed with the state because that
     # pair is exactly what a worker scans for on every poll.

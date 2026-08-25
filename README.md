@@ -38,12 +38,16 @@ open-source.
 
 **Early development.** This build registers endpoints, stores the submissions
 sent to them together with the durable obligation to deliver them, and runs a
-separate worker that performs the signed webhook delivery and retries it.
+separate worker that performs the signed webhook delivery and retries it. An
+operator can now list and reconfigure endpoints, read the delivery queue and its
+attempt history, and put a failed delivery back in the queue, all through the
+same authenticated management API.
 
-Endpoint configuration now requires a management API key. Form ingestion stays
-public, because an ingestion URL is meant to sit in the `action` attribute of
-somebody's HTML form. There is still no rate limiting and no spam protection,
-so a public deployment is exposed to whatever volume the internet sends it.
+Everything that administers the service requires a management API key. Form
+ingestion stays public, because an ingestion URL is meant to sit in the `action`
+attribute of somebody's HTML form. There is still no rate limiting and no spam
+protection, so a public deployment is exposed to whatever volume the internet
+sends it.
 
 | Capability                    | Status                    |
 | ----------------------------- | ------------------------- |
@@ -58,7 +62,11 @@ so a public deployment is exposed to whatever volume the internet sends it.
 | Retries with backoff          | Implemented               |
 | Schema migrations             | Implemented               |
 | API keys / authentication     | Implemented               |
-| Manual delivery replay        | **Not implemented**       |
+| Endpoint management           | Implemented               |
+| Delivery inspection           | Implemented               |
+| Manual delivery replay        | Implemented               |
+| Endpoint deletion             | **Not implemented**       |
+| Submission retrieval          | **Not implemented**       |
 | Rate limiting, spam handling  | **Not implemented**       |
 | Export, retention, dashboards | **Not implemented**       |
 
@@ -126,7 +134,7 @@ database is reachable and at the migration revision the build was written
 against, and refuse to start otherwise:
 
 ```
-the database is at migration '0001' but this build expects '0002'.
+the database is at migration '0002' but this build expects '0003'.
 Run 'alembic upgrade head' before starting.
 ```
 
@@ -210,11 +218,17 @@ Interactive API documentation is served at `http://127.0.0.1:8000/docs`.
 
 Administering the service needs a credential. Submitting a form does not.
 
-| Route                  | Credential                       |
-| ---------------------- | -------------------------------- |
-| `POST /endpoints`      | Management API key required      |
-| `POST /f/{endpoint_id}`| **Public**, no credential        |
-| `GET /health`          | **Public**, no credential        |
+| Route                                   | Credential                  |
+| --------------------------------------- | --------------------------- |
+| `POST /endpoints`                        | Management API key required |
+| `GET /endpoints`                         | Management API key required |
+| `GET /endpoints/{endpoint_id}`           | Management API key required |
+| `PATCH /endpoints/{endpoint_id}`         | Management API key required |
+| `GET /deliveries`                        | Management API key required |
+| `GET /deliveries/{delivery_id}`          | Management API key required |
+| `POST /deliveries/{delivery_id}/replay`  | Management API key required |
+| `POST /f/{endpoint_id}`                  | **Public**, no credential   |
+| `GET /health`                            | **Public**, no credential   |
 
 A management API key is an opaque bearer token that administers the whole
 service. It is not a user account, not a login, and not scoped to a tenant:
@@ -382,13 +396,140 @@ Returns `201 Created`:
 > this response, and there is no route that reads it back. Losing it means
 > creating a new endpoint.
 
-Reusing an ID returns `409 endpoint_already_exists`. There is no route to list,
-update or delete endpoints yet, so a webhook can only be configured at creation
-time.
+Reusing an ID returns `409 endpoint_already_exists`. To change an endpoint
+afterwards, see [Managing endpoints](#managing-endpoints).
 
 The key that created an endpoint is not recorded on it. A management key
 administers the service rather than owning a slice of it, and there is no
 tenancy model for an owner column to belong to.
+
+### Managing endpoints
+
+Every route below takes the same credential as `POST /endpoints`. The examples
+use an obvious placeholder for it:
+
+```bash
+export HYMICAL_KEY=hym_live_REPLACE_WITH_YOUR_KEY
+```
+
+#### `GET /endpoints`
+
+```bash
+curl "http://127.0.0.1:8000/endpoints?limit=2" \
+  -H "Authorization: Bearer $HYMICAL_KEY"
+```
+
+```json
+{
+  "items": [
+    {
+      "id": "contact-form",
+      "name": "Contact form",
+      "is_active": true,
+      "created_at": "2026-08-24T14:34:27.432598Z",
+      "webhook_url": "https://example.com/hooks/forms"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+`webhook_url` is returned because it is configuration rather than a credential:
+knowing where an endpoint delivers proves nothing and forges nothing. The
+signing secret is not returned, here or anywhere else. See
+[Pagination](#pagination) for what `next_cursor` does.
+
+#### `GET /endpoints/{endpoint_id}`
+
+```bash
+curl http://127.0.0.1:8000/endpoints/contact-form \
+  -H "Authorization: Bearer $HYMICAL_KEY"
+```
+
+The same representation as one item of the listing, for one endpoint, so a
+caller that already knows an ID does not have to page to find it. An unknown ID
+returns `404 endpoint_not_found`.
+
+#### `PATCH /endpoints/{endpoint_id}`
+
+`PATCH` rather than `PUT`, because only a few fields are yours to change. Send
+only what should change; anything omitted is left exactly as it was.
+
+```bash
+curl -X PATCH http://127.0.0.1:8000/endpoints/contact-form \
+  -H "Authorization: Bearer $HYMICAL_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "Support form", "is_active": false}'
+```
+
+| Field         | Meaning                                                          |
+| ------------- | ---------------------------------------------------------------- |
+| `name`        | New label, 1 to 200 characters                                    |
+| `is_active`   | Whether the endpoint accepts submissions                          |
+| `webhook_url` | New destination, or `null` to remove the webhook entirely         |
+
+**The endpoint ID is not changeable.** It is the primary key, and it appears in
+the `action` URL of every HTML form pointing at the endpoint, so changing it
+would break deployed forms. An `id` in the body is ignored.
+
+**Deleting an endpoint is not implemented.** Disabling one is enough for now:
+deletion immediately raises what happens to its stored submissions, its delivery
+history and the foreign keys between them, and none of that is decided yet.
+
+#### Disabling and re-enabling
+
+```bash
+curl -X PATCH http://127.0.0.1:8000/endpoints/contact-form \
+  -H "Authorization: Bearer $HYMICAL_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"is_active": false}'
+```
+
+Disabling takes effect on the very next submission, which is refused with
+`409 endpoint_inactive` and stores nothing. Nothing caches the endpoint, so
+there is no window in which a disabled endpoint still accepts a form. Sending
+`{"is_active": true}` restores acceptance just as immediately.
+
+Deliveries that were already queued are **not** affected. They are work this
+service already promised to do, and disabling an endpoint stops it taking on
+more rather than abandoning what it owes.
+
+#### Changing the webhook
+
+The destination and its signing secret change together, because a secret belongs
+to a receiver rather than to an endpoint:
+
+| Change                              | What happens to the secret            |
+| ----------------------------------- | ------------------------------------- |
+| `webhook_url` omitted                | Unchanged                             |
+| `webhook_url` set to the same URL    | Unchanged                             |
+| `webhook_url` set to a different URL | A new one is generated and returned   |
+| `webhook_url` set on an endpoint with no webhook | A new one is generated and returned |
+| `webhook_url` set to `null`          | Removed along with the destination    |
+
+```json
+{
+  "id": "contact-form",
+  "name": "Contact form",
+  "is_active": true,
+  "created_at": "2026-08-24T14:34:27.432598Z",
+  "webhook_url": "https://example.com/hooks/forms-v2",
+  "webhook_secret": "whsec_6f1c...  (64 hex characters)"
+}
+```
+
+> **Save `webhook_secret` now.** As at creation, it is returned only in the
+> response of the request that generated it. `webhook_secret` is `null` when the
+> request did not generate one, and the field does not exist at all on a read.
+
+Carrying the old secret over to a new destination would hand a receiver that
+never had it the ability to verify signatures, and leave the previous receiver
+holding a live secret. So the two always move together.
+
+**Deliveries already queued keep the destination and secret they snapshotted**
+when their submission was accepted. Changing configuration here never redirects
+work that is already owed, and never leaves a queued payload signed with a
+secret its receiver never had.
 
 ### `POST /f/{endpoint_id}`
 
@@ -600,8 +741,12 @@ Delivery is attempted immediately, then backs off by doubling, capped:
 | 5       | 80s             |
 
 After `FORMS_WEBHOOK_MAX_ATTEMPTS` (default 5) the delivery becomes `failed` and
-is never retried. There is no jitter: the schedule is deliberately exactly
-predictable. Every attempt, including the last, stays in `delivery_attempts`.
+is never retried automatically. There is no jitter: the schedule is deliberately
+exactly predictable. Every attempt, including the last, stays in
+`delivery_attempts`.
+
+The allowance is per retry cycle, not per lifetime, so a
+[manual replay](#manual-delivery-replay) starts the schedule again from the top.
 
 #### At-least-once, not exactly-once
 
@@ -624,8 +769,8 @@ attempts it has had, when it is next due, and when it finished.
 `delivery_attempts` holds one row per request that actually went out, numbered,
 with the outcome, the HTTP status when there was one, and a bounded failure
 message. Response bodies are **not** stored, and neither is the signing secret.
-A job that is inspected and found not due records nothing. There is no API to
-read either table yet; query them directly.
+A job that is inspected and found not due records nothing. Both are readable
+through [Inspecting deliveries](#inspecting-deliveries).
 
 #### Destinations that are refused
 
@@ -633,13 +778,198 @@ A webhook URL must use `http` or `https` and must not name a loopback, private,
 link-local, multicast, reserved or unspecified address. That covers `localhost`,
 `127.0.0.1`, `[::1]`, `[::ffff:127.0.0.1]`, `10.0.0.0/8`, `192.168.0.0/16`, and
 the `169.254.169.254` cloud metadata endpoint. Rejections return
-`422 invalid_webhook_url`.
+`422 invalid_webhook_url`. The same check runs on a destination supplied through
+`PATCH /endpoints/{endpoint_id}`.
 
 This is **not** complete SSRF protection; see [Limitations](#limitations).
 
 For local development, `FORMS_ALLOW_PRIVATE_WEBHOOK_TARGETS=true` lifts the
 address restriction so you can point a webhook at a server on your own machine.
 Do not enable it in production.
+
+### Inspecting deliveries
+
+The delivery queue is operational data, so reading it needs a management API key.
+The examples below use the same placeholder as the endpoint routes:
+
+```bash
+export HYMICAL_KEY=hym_live_REPLACE_WITH_YOUR_KEY
+```
+
+#### `GET /deliveries`
+
+```bash
+curl "http://127.0.0.1:8000/deliveries?state=failed&endpoint_id=contact-form" \
+  -H "Authorization: Bearer $HYMICAL_KEY"
+```
+
+| Filter        | Meaning                                                          |
+| ------------- | ---------------------------------------------------------------- |
+| `endpoint_id` | Only deliveries for one endpoint                                  |
+| `state`       | One of `pending`, `processing`, `delivered`, `failed`             |
+| `limit`       | Page size, 1 to 100, default 50                                   |
+| `cursor`      | The previous page's `next_cursor`                                 |
+
+```json
+{
+  "items": [
+    {
+      "id": "whd_9a3f...",
+      "submission_id": "sub_48984534f33749c49a88de2d59400dce",
+      "endpoint_id": "contact-form",
+      "state": "failed",
+      "destination_url": "https://example.com/hooks/forms",
+      "attempt_count": 5,
+      "cycle_attempt_count": 5,
+      "next_attempt_at": "2026-08-24T15:12:07.117440Z",
+      "created_at": "2026-08-24T14:34:27.651841Z",
+      "completed_at": "2026-08-24T15:12:07.204118Z"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+An unknown `state` is refused with `422 invalid_request`. An `endpoint_id` that
+matches nothing is not an error: it is a filter that selected no rows, and the
+answer is an empty page.
+
+**Submitted field values are not returned**, in the listing or the detail. There
+is no route that reads a submission back yet, and a delivery view is not a way
+around that.
+
+#### `GET /deliveries/{delivery_id}`
+
+The same fields as one listed item, plus the ordered attempt history:
+
+```json
+{
+  "id": "whd_9a3f...",
+  "state": "failed",
+  "attempt_count": 5,
+  "cycle_attempt_count": 5,
+  "attempts": [
+    {
+      "attempt_number": 1,
+      "attempted_at": "2026-08-24T14:34:27.884210Z",
+      "outcome": "http_error",
+      "response_status": 503,
+      "error": "destination responded with HTTP 503"
+    }
+  ]
+}
+```
+
+Attempts are ordered by `attempt_number`, ascending. `outcome` is one of
+`succeeded`, `http_error`, `timeout` or `network_error`. `response_status` is
+null when the destination never answered at all. The snapshotted signing secret,
+the request headers and the response body are not there: the first two are never
+returned by any route, and the third is never stored.
+
+An unknown ID returns `404 delivery_not_found`.
+
+### Manual delivery replay
+
+#### `POST /deliveries/{delivery_id}/replay`
+
+```bash
+curl -X POST http://127.0.0.1:8000/deliveries/whd_9a3f.../replay \
+  -H "Authorization: Bearer $HYMICAL_KEY"
+```
+
+Returns `200 OK` with the delivery's new state:
+
+```json
+{
+  "id": "whd_9a3f...",
+  "state": "pending",
+  "attempt_count": 5,
+  "cycle_attempt_count": 0,
+  "next_attempt_at": "2026-08-24T16:02:11.006318Z",
+  "completed_at": null
+}
+```
+
+**Only a delivery in terminal `failed` can be replayed.** A `pending` one is
+already queued, a `processing` one is already being sent, and a `delivered` one
+already reached its receiver. All three are refused with
+`409 delivery_not_replayable`, and the error names the state that made it
+ineligible.
+
+**`200`, not `202`.** A `202` would say this request will be carried out later,
+which invites reading the replay as the delivery. It is not. This request
+finishes here, and what it leaves behind is a queued row.
+
+#### What replay actually does
+
+Replay is a state change. **The API process sends nothing**: it has no outbound
+HTTP client at all, which is what makes that structural rather than a promise.
+The delivery becomes due, the ordinary worker claims it on its next poll through
+its ordinary claiming path, and the ordinary retry rules apply from there.
+
+```
+failed -> replay -> pending and due -> worker claims -> delivered, or retries
+```
+
+Everything that identifies the delivery is preserved:
+
+- the **same logical delivery**, not a second one;
+- the **same submission**, unmodified and not duplicated;
+- the **snapshotted destination and signing secret**, so the receiver verifies
+  the replayed payload exactly as it would have verified the original;
+- **every historical attempt row**, untouched.
+
+#### Attempt numbering and the retry budget
+
+A delivery carries two counters, because they answer two different questions:
+
+| Field                 | Meaning                                                |
+| --------------------- | ------------------------------------------------------ |
+| `attempt_count`       | Every request ever made for this delivery               |
+| `cycle_attempt_count` | Requests made since it last entered the queue           |
+
+`attempt_count` only ever goes up, and it is what numbers the attempt history,
+so **an attempt number is never reused** however often a delivery is replayed.
+`cycle_attempt_count` is what the retry allowance is measured against, and a
+replay resets it to zero.
+
+That is the whole model: a replay starts a fresh retry cycle while preserving
+the history. A delivery that exhausted five automatic attempts and is then
+replayed gets five more, numbered 6 through 10, rather than failing immediately
+because five have already been spent. Until something is replayed the two
+counters are equal.
+
+#### Two operators replaying at once
+
+The transition is a single conditional `UPDATE` on the delivery's state, so the
+database decides who wins, not a check in application code. Exactly one request
+requeues the delivery. The other reads back the state that was actually settled
+on and is refused with `409 delivery_not_replayable`, the same answer it would
+get for a delivery that was never failed. No duplicate work is created either
+way. This is tested against real PostgreSQL with independent connections.
+
+### Pagination
+
+Both list routes page the same way. Items come back newest first, ordered by
+creation time with the identifier as a tie-break, so a page is exactly
+reproducible. `limit` is 1 to 100 and defaults to 50; anything outside that is
+refused with `422 invalid_request` rather than quietly clamped.
+
+`next_cursor` is the identifier of the last item on the page. Pass it as
+`cursor` to continue:
+
+```bash
+curl "http://127.0.0.1:8000/deliveries?limit=50&cursor=whd_9a3f..." \
+  -H "Authorization: Bearer $HYMICAL_KEY"
+```
+
+A full page always carries a cursor, even when it happens to be the last one,
+because knowing otherwise would cost an extra read on every page. A walk
+therefore ends on one empty page rather than on a null cursor. A cursor that
+names no row is refused with `422 invalid_cursor`.
+
+There is deliberately **no total count**. Counting an operational table on every
+page is not free, and nothing here needs the number.
 
 ### Try it
 
@@ -694,16 +1024,19 @@ add.
 | 401    | `invalid_api_key`          | The management API key is malformed, unknown or revoked   |
 | 404    | `invalid_endpoint_id`      | Submission path is not a well-formed endpoint ID          |
 | 404    | `endpoint_not_found`       | Endpoint ID is well formed but no such endpoint exists    |
+| 404    | `delivery_not_found`       | No delivery with that ID exists                           |
 | 404    | `not_found`                | Unknown path                                              |
 | 405    | `method_not_allowed`       | Wrong method for a known path                             |
 | 409    | `endpoint_inactive`        | Endpoint exists but is not accepting submissions          |
 | 409    | `endpoint_already_exists`  | Endpoint ID is already taken                              |
 | 409    | `idempotency_conflict`     | Idempotency key already used for different content        |
+| 409    | `delivery_not_replayable`  | Delivery has not terminally failed                        |
 | 413    | `request_body_too_large`   | Body exceeded `FORMS_MAX_BODY_BYTES`                      |
 | 415    | `unsupported_media_type`   | Content type is not a supported form encoding             |
 | 422    | `empty_submission`         | No fields were submitted                                  |
+| 422    | `invalid_cursor`           | Pagination cursor does not continue from a known row      |
 | 422    | `invalid_endpoint_id`      | Endpoint ID in a request body breaks the ID rules         |
-| 422    | `invalid_request`          | Request body failed schema validation                     |
+| 422    | `invalid_request`          | Request body or query parameters failed schema validation |
 | 422    | `invalid_webhook_url`      | Webhook destination is malformed or not permitted         |
 | 422    | `file_upload_not_supported`| A multipart part carried a file                           |
 | 422    | ingestion rule codes       | See below                                                 |
@@ -782,7 +1115,8 @@ schema, which is what keeps the fast suite's shortcut honest. Others upgrade a
 PostgreSQL database that already holds endpoints, submissions, deliveries and
 attempts, and check that the data is exactly what it was afterwards, that the
 downgrade removes only what the newer revision added, and that the data survives
-that too.
+that too. Another settles the manual replay race: several real connections
+replay one failed delivery at the same instant, and exactly one of them wins.
 
 CI runs the lint, format and type checks once, the fast suite across Python
 3.11 to 3.13, and the PostgreSQL suite once against a PostgreSQL 17 service.
@@ -807,7 +1141,11 @@ src/hymical_forms/
   schema.py         the boundary between the application and Alembic
   main.py           ASGI entrypoint
   api/              HTTP routes and response models
+    endpoints.py    creating, listing, inspecting and changing endpoints
+    deliveries.py   reading the delivery queue and replaying a failed delivery
+    submissions.py  public form ingestion
     security.py     the management authentication dependency
+    pagination.py   the one cursor design both list routes share
   migrations/       Alembic environment and revisions
 ```
 
@@ -861,6 +1199,21 @@ This is covered by real integration tests: concurrent PostgreSQL sessions claim
 disjoint work, a row another worker holds is skipped rather than waited on, and
 an expired lease becomes reclaimable by exactly one worker.
 
+Manual replay is settled the same way, by the database rather than by the
+application: one conditional `UPDATE` moves a delivery out of `failed`, and a
+second simultaneous request matches no row and is refused. Reading the state,
+judging it in Python and then writing it would let both requests pass the check
+and both reset the retry cycle, which is the duplicated work this exists to
+prevent.
+
+The two attempt counters on a delivery are what let a replay be both honest and
+useful. `attempts` is the lifetime total and only ever rises, so it can number
+the audit trail without a number ever being reused. `cycle_attempts` is the
+count since the delivery last entered the queue, so the retry policy has
+something to measure that a replay is allowed to reset. Before anything is
+replayed the two are the same number, which is why upgrading an existing
+database sets one from the other.
+
 ## Limitations
 
 - **Delivery is at-least-once, never exactly-once.** A worker that delivers
@@ -872,8 +1225,13 @@ an expired lease becomes reclaimable by exactly one worker.
   and every valid key can do everything a management key can do. Separate keys
   are useful for revoking one caller without disturbing another, and for nothing
   else yet.
-- **A failed delivery is final and cannot be replayed.** Once a delivery reaches
-  `failed`, nothing retries it and there is no manual replay route.
+- **A failed delivery is never retried on its own.** It stays `failed` until an
+  operator replays it, and nothing notices that it failed for you: there is no
+  alerting, no dead-letter notification and no automatic sweep.
+- **A concurrent `PATCH` on one endpoint is last-write-wins.** The row is locked
+  for the transaction on PostgreSQL, so two operators rotating a signing secret
+  at the same moment are serialised and both get an answer that matches what was
+  stored. SQLite has no such locking and is not a production target.
 - **The lease must outlast a delivery attempt.** A batch is delivered
   concurrently, so it takes about as long as its slowest single delivery rather
   than the sum, but if `FORMS_WORKER_LEASE_SECONDS` were set below the connect
@@ -899,18 +1257,20 @@ an expired lease becomes reclaimable by exactly one worker.
   to absorb and the ingestion path never pays because it is not authenticated. A
   failure to write it is logged and ignored rather than allowed to turn a valid
   credential into a `401`.
-- **A webhook can only be set when the endpoint is created.** There is no route
-  to change a destination or rotate a signing secret.
-- **No API for delivery attempts.** They are recorded, but reading them means
-  querying the database directly.
+- **A signing secret cannot be rotated in place.** Rotation happens only as a
+  side effect of changing the destination, so re-keying a receiver that stays at
+  the same URL means pointing the endpoint elsewhere and back, or standing up a
+  second URL. A dedicated rotate action is not implemented.
 - **Migrations are applied by hand, one command at a time.** There is no
   zero-downtime story and none is claimed: a migration that rewrites a table
   will lock it, and a build whose expected revision does not match the database
   refuses to start rather than serving against a schema it does not understand.
   Plan a deploy as migrate-then-restart.
-- **No way to read submissions back over the API.** They are stored, but
-  retrieval, export and retention are not implemented.
-- **No route to list, update or delete endpoints.**
+- **No way to read submissions back over the API.** They are stored, and a
+  delivery can be inspected, but the submitted values themselves are deliberately
+  not exposed by any route. Retrieval, export and retention are not implemented.
+- **Endpoints cannot be deleted, and an endpoint ID cannot be changed.**
+  Disabling an endpoint is the way to stop it accepting submissions.
 - **No file uploads.** Multipart text fields are accepted; file parts are
   rejected.
 - **`multipart/form-data` bodies are buffered in memory,** bounded by

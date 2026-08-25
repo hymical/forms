@@ -8,18 +8,20 @@ the database untouched. A few own their transaction and say so:
 deliver it as one atomic unit and must roll both back together to settle an
 idempotency race; :func:`claim_due_deliveries`, because a claim is only worth
 anything once it is committed; :func:`complete_attempt`, because the audit
-record and the state it justifies have to land together; and the two management
-key writes, :func:`revoke_management_key` and :func:`record_management_key_use`,
-because each is the whole of what its caller came to do.
+record and the state it justifies have to land together; :func:`update_endpoint`
+and :func:`requeue_failed_delivery`, because each is the whole of what its
+management request came to do; and the two management key writes,
+:func:`revoke_management_key` and :func:`record_management_key_use`, for the
+same reason.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
-from sqlalchemy import ColumnElement, and_, or_, select, update
+from sqlalchemy import ColumnElement, Select, and_, or_, select, tuple_, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -36,6 +38,25 @@ from hymical_forms.webhooks import (
     new_delivery_attempt_id,
     new_webhook_delivery_id,
 )
+
+# The two tables management routes page through. Both are keyed by an opaque
+# identifier and carry a creation timestamp, which is all cursor pagination here
+# asks of a table.
+_Paged = TypeVar("_Paged", models.Endpoint, models.WebhookDelivery)
+
+
+class UnknownCursor(Exception):
+    """
+    raised when a pagination cursor does not name a row to continue from
+    """
+
+    def __init__(self, cursor: str) -> None:
+        """
+        record the cursor that could not be resolved
+        :param cursor: the opaque cursor the caller asked to continue from
+        """
+        super().__init__("the pagination cursor does not name a known row")
+        self.cursor = cursor
 
 
 class EndpointAlreadyExists(Exception):
@@ -98,6 +119,73 @@ def get_endpoint(session: Session, endpoint_id: str) -> models.Endpoint | None:
     :returns: the endpoint, or None if no endpoint holds that identifier
     """
     return session.get(models.Endpoint, endpoint_id)
+
+
+def list_endpoints(
+    session: Session, *, limit: int, after: str | None = None
+) -> list[models.Endpoint]:
+    """
+    read one page of endpoints, newest first
+    :param session: the session to query through
+    :param limit: the most endpoints to return
+    :param after: identifier of the last endpoint on the previous page, or None to start
+    :returns: the page, at most ``limit`` long
+    :raises UnknownCursor: if ``after`` does not name an existing endpoint
+    """
+    endpoint = models.Endpoint
+    statement = select(endpoint).order_by(endpoint.created_at.desc(), endpoint.id.desc())
+    if after is not None:
+        statement = statement.where(_page_after(session, endpoint, after))
+    return list(session.scalars(statement.limit(limit)))
+
+
+def get_endpoint_for_update(session: Session, endpoint_id: str) -> models.Endpoint | None:
+    """
+    read an endpoint with the intention of changing it in the same transaction
+    :param session: the session to query through
+    :param endpoint_id: the public identifier to resolve
+    :returns: the endpoint, or None if no endpoint holds that identifier
+    """
+    # Locked on PostgreSQL, because two operators changing one endpoint's webhook
+    # at the same moment would otherwise both read the old destination, both mint
+    # a secret, and leave one of them holding a secret this service never stored.
+    # SQLite has no row locking and serialises writers anyway; it is not a
+    # production target.
+    statement = select(models.Endpoint).where(models.Endpoint.id == endpoint_id)
+    if session.get_bind().dialect.name == "postgresql":
+        statement = statement.with_for_update()
+    return session.scalars(statement).one_or_none()
+
+
+def update_endpoint(
+    session: Session,
+    endpoint: models.Endpoint,
+    *,
+    name: str,
+    is_active: bool,
+    webhook_url: str | None,
+    webhook_secret: str | None,
+) -> models.Endpoint:
+    """
+    write a resolved endpoint configuration and commit it
+    :param session: the session to write through
+    :param endpoint: the endpoint being changed, already loaded in this transaction
+    :param name: the label the endpoint should end up with
+    :param is_active: whether the endpoint should accept submissions
+    :param webhook_url: the destination it should end up with, or None for no webhook
+    :param webhook_secret: the signing secret for that destination, paired with the URL
+    :returns: the endpoint, changed and committed
+    """
+    # Every value is resolved by the caller, so the decision about what "unchanged"
+    # means for a partial update stays in one place and this function has no
+    # opinion about it. Deliveries already queued are untouched on purpose: they
+    # snapshotted their destination and secret when the submission was accepted.
+    endpoint.name = name
+    endpoint.is_active = is_active
+    endpoint.webhook_url = webhook_url
+    endpoint.webhook_secret = webhook_secret
+    session.commit()
+    return endpoint
 
 
 class IdempotencyKeyReused(Exception):
@@ -348,7 +436,15 @@ def complete_attempt(
     """
     # The audit row and the state it justifies are written together, so the
     # history can never disagree with the job about how many attempts happened.
+    #
+    # Two counters, because they answer two different questions. The attempt is
+    # numbered from the lifetime total, so a number is never reused however often
+    # the delivery has been replayed. The retry allowance is measured against the
+    # current cycle, so a replayed delivery gets a whole schedule again rather
+    # than failing immediately on a total that is already spent. Until something
+    # is replayed the two are the same number.
     attempt_number = delivery.attempts + 1
+    cycle_attempt = delivery.cycle_attempts + 1
     attempt = models.DeliveryAttempt(
         id=new_delivery_attempt_id(),
         delivery_id=delivery.id,
@@ -363,14 +459,15 @@ def complete_attempt(
     session.add(attempt)
 
     delivery.attempts = attempt_number
+    delivery.cycle_attempts = cycle_attempt
     delivery.claim_expires_at = None
 
     if result.outcome is DeliveryOutcome.SUCCEEDED:
         delivery.state = DeliveryState.DELIVERED
         delivery.completed_at = now
-    elif is_retryable(result) and not policy.is_exhausted(attempt_number):
+    elif is_retryable(result) and not policy.is_exhausted(cycle_attempt):
         delivery.state = DeliveryState.PENDING
-        delivery.next_attempt_at = now + policy.delay_after(attempt_number)
+        delivery.next_attempt_at = now + policy.delay_after(cycle_attempt)
     else:
         # Either the receiver said something repeating will not fix, or the
         # allowance ran out. Either way this is the last word on the delivery.
@@ -379,6 +476,150 @@ def complete_attempt(
 
     session.commit()
     return attempt
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryRecord:
+    """
+    a delivery together with the endpoint whose submission it carries
+    """
+
+    # The endpoint is not a column on the delivery: it is reached through the
+    # submission. Carrying it alongside means a management response can report
+    # which endpoint a delivery belongs to without a second query per row.
+    delivery: models.WebhookDelivery
+    endpoint_id: str
+
+
+def list_deliveries(
+    session: Session,
+    *,
+    limit: int,
+    after: str | None = None,
+    endpoint_id: str | None = None,
+    state: str | None = None,
+) -> list[DeliveryRecord]:
+    """
+    read one page of the delivery queue, newest first
+    :param session: the session to query through
+    :param limit: the most deliveries to return
+    :param after: identifier of the last delivery on the previous page, or None to start
+    :param endpoint_id: only deliveries for this endpoint, or None for every endpoint
+    :param state: only deliveries in this state, or None for every state
+    :returns: the page, at most ``limit`` long
+    :raises UnknownCursor: if ``after`` does not name an existing delivery
+    """
+    delivery = models.WebhookDelivery
+    statement = _delivery_query().order_by(delivery.created_at.desc(), delivery.id.desc())
+    if endpoint_id is not None:
+        statement = statement.where(models.Submission.endpoint_id == endpoint_id)
+    if state is not None:
+        statement = statement.where(delivery.state == state)
+    if after is not None:
+        statement = statement.where(_page_after(session, delivery, after))
+
+    return [
+        DeliveryRecord(row, endpoint) for row, endpoint in session.execute(statement.limit(limit))
+    ]
+
+
+def get_delivery(session: Session, delivery_id: str) -> DeliveryRecord | None:
+    """
+    look one delivery up by its identifier
+    :param session: the session to query through
+    :param delivery_id: the identifier to resolve
+    :returns: the delivery and its endpoint, or None if no delivery holds that identifier
+    """
+    row = session.execute(
+        _delivery_query().where(models.WebhookDelivery.id == delivery_id)
+    ).one_or_none()
+    return DeliveryRecord(row[0], row[1]) if row is not None else None
+
+
+def list_delivery_attempts(session: Session, delivery_id: str) -> list[models.DeliveryAttempt]:
+    """
+    read the ordered attempt history of one delivery
+    :param session: the session to query through
+    :param delivery_id: the delivery whose history to read
+    :returns: every recorded attempt, lowest attempt number first
+    """
+    # Attempt numbers never repeat within a delivery, even across a manual replay,
+    # so ordering by one is already total. The identifier is a tie-break that
+    # cannot be reached rather than one that is expected to matter.
+    attempt = models.DeliveryAttempt
+    return list(
+        session.scalars(
+            select(attempt)
+            .where(attempt.delivery_id == delivery_id)
+            .order_by(attempt.attempt_number, attempt.id)
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayOutcome:
+    """
+    what a manual replay request did, and what the delivery looks like now
+    """
+
+    # ``record`` is None only when the delivery does not exist. ``requeued`` is
+    # False for a delivery that was not failed, which includes the loser of two
+    # simultaneous replays: it reads back the pending delivery the winner made.
+    record: DeliveryRecord | None
+    requeued: bool
+
+
+def requeue_failed_delivery(session: Session, delivery_id: str, *, now: datetime) -> ReplayOutcome:
+    """
+    put a terminally failed delivery back in the queue for the worker to claim
+    :param session: the session to write through
+    :param delivery_id: the delivery to requeue
+    :param now: the instant the delivery should become due again
+    :returns: the resulting delivery and whether this request is what requeued it
+    """
+    # The transition is one conditional UPDATE, so the database decides who wins.
+    # Reading the state, judging it in Python and then writing would let two
+    # simultaneous replays both pass the check and both reset the retry cycle,
+    # which is exactly the duplicated work this is meant to prevent.
+    #
+    # Only the queueing state is touched. The snapshotted destination and signing
+    # secret, the submission, the lifetime attempt count and every recorded
+    # attempt are left exactly as they are: a replay resumes a delivery, it does
+    # not start a new one. Clearing ``cycle_attempts`` is what grants the fresh
+    # retry allowance, and clearing ``completed_at`` is required by the check
+    # constraint that says a delivery is finished exactly when it says it is.
+    delivery = models.WebhookDelivery
+    result = cast(
+        "CursorResult[Any]",
+        session.execute(
+            update(delivery)
+            .where(delivery.id == delivery_id)
+            .where(delivery.state == DeliveryState.FAILED)
+            .values(
+                state=DeliveryState.PENDING,
+                cycle_attempts=0,
+                next_attempt_at=now,
+                claim_expires_at=None,
+                completed_at=None,
+            )
+            .execution_options(synchronize_session=False)
+        ),
+    )
+    session.commit()
+
+    # Read after the commit, so both the winner and the loser describe the state
+    # the database actually settled on rather than the one they hoped for.
+    return ReplayOutcome(get_delivery(session, delivery_id), requeued=result.rowcount == 1)
+
+
+def _delivery_query() -> Select[tuple[models.WebhookDelivery, str]]:
+    """
+    build the read every delivery management route starts from
+    :returns: a select of deliveries joined to the endpoint they belong to
+    """
+    return select(models.WebhookDelivery, models.Submission.endpoint_id).join(
+        models.Submission, models.Submission.id == models.WebhookDelivery.submission_id
+    )
 
 
 def create_management_key(
@@ -491,6 +732,29 @@ def record_management_key_use(session: Session, key_id: str, *, now: datetime) -
         .values(last_used_at=now)
     )
     session.commit()
+
+
+def _page_after(session: Session, model: type[_Paged], cursor: str) -> ColumnElement[bool]:
+    """
+    build the test for rows that come after a cursor, in newest-first order
+    :param session: the session to resolve the cursor through
+    :param model: the table being paged
+    :param cursor: the identifier of the last row on the previous page
+    :returns: a SQL condition matching only the rows that follow it
+    :raises UnknownCursor: if the cursor does not name an existing row
+    """
+    anchor = session.get(model, cursor)
+    if anchor is None:
+        # Refused rather than treated as the first page, so a caller that pages
+        # past a row somebody deleted learns about it instead of silently
+        # starting again from the top.
+        raise UnknownCursor(cursor)
+
+    # A row-value comparison, so the tie-break and the ordering are one expression
+    # rather than two that have to be kept in agreement. Both timestamps and both
+    # identifiers are compared, which is what makes a page boundary total even
+    # when several rows were created in the same transaction.
+    return tuple_(model.created_at, model.id) < (anchor.created_at, anchor.id)
 
 
 def _settle(existing: models.Submission, payload_fingerprint: str | None) -> Submission:
