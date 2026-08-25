@@ -37,6 +37,13 @@ dev = [
     "pytest>=8.3",
     "ruff>=0.6",
 ]
+# Documentation tooling only. Deliberately a group of its own rather than part of
+# `dev`, so that nothing needed to build the site can drift into what is needed to
+# run or test the service.
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+]
 
 [project.urls]
 Homepage = "https://github.com/hymical/forms"

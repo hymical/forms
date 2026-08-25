@@ -1,0 +1,118 @@
+site_name: Hymical Forms
+site_description: Reliable form ingestion and webhook delivery for developers.
+site_url: https://hymical.github.io/forms/
+site_author: Hymical
+
+repo_url: https://github.com/hymical/forms
+repo_name: hymical/forms
+edit_uri: edit/main/docs/
+
+copyright: Licensed under the Apache License 2.0
+
+# Anchors and unrecognized links are only INFO by default, which means a strict
+# build would not catch a cross-reference pointing at a heading that moved. Both
+# are raised to warnings so that `mkdocs build --strict` fails on them.
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+theme:
+  name: material
+  # The symbol rather than the wordmark: it is a transparent PNG, so it reads
+  # against both the light and the dark header without a second asset.
+  logo: images/logo_symbol_transparent.png
+  favicon: images/logo_symbol_transparent.png
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    # Top-level sections become tabs, second level becomes the sidebar. With six
+    # sections and a few pages each, this is what keeps the sidebar readable.
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - search.highlight
+    - search.suggest
+    - content.code.copy
+    - toc.follow
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.superfences:
+      custom_fences:
+        # Mermaid diagrams render natively on GitHub and through this fence in
+        # Material, so one diagram source works in the README and on the site.
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/hymical/forms
+      name: Hymical Forms on GitHub
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: getting-started/installation.md
+      - Configuration: getting-started/configuration.md
+      - Quick Start: getting-started/quick-start.md
+  - Guides:
+      - Form Ingestion: guides/form-ingestion.md
+      - Idempotency: guides/idempotency.md
+      - Webhook Delivery: guides/webhooks.md
+      - Rate Limiting: guides/rate-limiting.md
+      - Endpoint Management: guides/endpoint-management.md
+      - Delivery Replay: guides/delivery-replay.md
+  - API Reference:
+      - Authentication: api/authentication.md
+      - Endpoints: api/endpoints.md
+      - Submissions: api/submissions.md
+      - Deliveries: api/deliveries.md
+      - Errors: api/errors.md
+  - Operations:
+      - Worker: operations/worker.md
+      - Database Migrations: operations/migrations.md
+      - Reverse Proxy: operations/reverse-proxy.md
+      - Configuration Reference: operations/configuration-reference.md
+  - Architecture:
+      - Overview: architecture/overview.md
+      - Transactional Outbox: architecture/transactional-outbox.md
+      - Delivery Semantics: architecture/delivery-semantics.md
+      - Concurrency: architecture/concurrency.md
+      - Security: architecture/security.md
+  - Development:
+      - Testing: development/testing.md
+      - Contributing: development/contributing.md
+  - Reference:
+      - Limitations: reference/limitations.md
