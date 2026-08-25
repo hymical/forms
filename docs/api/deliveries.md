@@ -27,8 +27,8 @@ Paging works exactly as it does for endpoints. See
 | Field | Meaning |
 | --- | --- |
 | `id` | Delivery identifier |
-| `submission_id` | The submission this delivery carries |
-| `endpoint_id` | The endpoint that submission was addressed to |
+| `submission_id` | The submission this delivery carries, or `null` once retention has removed it |
+| `endpoint_id` | The endpoint the submission was addressed to, recorded on the delivery |
 | `state` | `pending`, `processing`, `delivered` or `failed` |
 | `destination_url` | The URL snapshotted when the submission was accepted |
 | `attempt_count` | Every request ever made for this delivery |
@@ -78,8 +78,10 @@ Attempts are ordered by `attempt_number`, ascending.
 !!! note "What is never in these responses"
 
     Submitted field values, the snapshotted signing secret, the request headers,
-    and the response body. The first three are never returned by any route; the
-    last is never stored.
+    and the response body. The signing secret and the headers are never returned
+    by any route, and the response body is never stored. Field values are
+    returned only by the authenticated
+    [submission routes](submission-management.md).
 
 ## `POST /deliveries/{delivery_id}/replay`
 
@@ -107,4 +109,5 @@ and leaves `attempt_count` and every historical attempt row untouched.
 
 - [Delivery inspection and replay](../guides/delivery-replay.md)
 - [Webhook delivery](../guides/webhooks.md) for the retry schedule
+- [Submission Management](submission-management.md) for what a delivery carried
 - [Errors](errors.md) for the full error table

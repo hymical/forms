@@ -142,6 +142,7 @@ def seed_failed_delivery(
         models.WebhookDelivery(
             id=delivery_id,
             submission_id=submission_id,
+            endpoint_id=endpoint_id,
             destination_url="https://example.invalid/hook",
             signing_secret="whsec_" + "a" * 64,
             state=DeliveryState.FAILED,
@@ -201,6 +202,7 @@ def seed_due_deliveries(
             models.WebhookDelivery(
                 id=delivery_id,
                 submission_id=submission_id,
+                endpoint_id=endpoint_id,
                 destination_url="https://example.invalid/hook",
                 signing_secret="whsec_" + "a" * 64,
                 state=DeliveryState.PENDING,

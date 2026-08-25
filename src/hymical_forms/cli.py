@@ -1,11 +1,13 @@
 """
-the operator command line for management API keys
+the operator command line
 
 Run it as its own process, against the database ``FORMS_DATABASE_URL`` names::
 
     python -m hymical_forms.cli create-key --name local-admin
     python -m hymical_forms.cli list-keys
     python -m hymical_forms.cli revoke-key mk_1f0c9a...
+    python -m hymical_forms.cli cleanup-submissions --dry-run
+    python -m hymical_forms.cli cleanup-submissions
 
 Keys are minted here rather than over HTTP, and that is the whole answer to how
 the first one comes into being. A route that issued a management credential
@@ -13,6 +15,12 @@ without needing one would be an unauthenticated way to gain full management
 access, which is the thing this boundary exists to remove. Nothing is generated
 at startup and no key is shipped in this repository, so a deployment has exactly
 the credentials an operator deliberately created.
+
+Retention cleanup is here for a related reason: it deletes stored form data, and
+that should be something a person runs deliberately against a database they
+named, not something an API process does on the side of serving a request.
+Scheduling it is left to cron, a systemd timer, or whatever already runs the
+rest of your periodic work; this service ships no daemon for it.
 """
 
 from __future__ import annotations
@@ -28,10 +36,11 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from hymical_forms import apikeys, storage
+from hymical_forms import apikeys, retention, storage
 from hymical_forms.config import Settings
 from hymical_forms.db import create_engine_from_url, create_session_factory
 from hymical_forms.models import ManagementApiKey, utcnow
+from hymical_forms.retention import RetentionPolicy
 from hymical_forms.schema import SchemaNotReady, verify_schema
 
 PROGRAM = "python -m hymical_forms.cli"
@@ -85,7 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         prog=PROGRAM,
-        description="Create, list and revoke Hymical Forms management API keys.",
+        description=(
+            "Administer a Hymical Forms deployment: manage its API keys, and delete "
+            "stored submissions that have outlived the configured retention."
+        ),
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
 
@@ -110,6 +122,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     revoke.add_argument("key_id", help="The key ID, as shown by list-keys.")
 
+    cleanup = subcommands.add_parser(
+        "cleanup-submissions",
+        help="Delete stored submissions older than the configured retention.",
+        description=(
+            "Delete stored submissions that have outlived FORMS_SUBMISSION_RETENTION_DAYS. "
+            "A submission is only removed once nothing still needs it: one whose webhook "
+            "delivery is pending, processing, or failed and therefore replayable is kept, "
+            "however old it is. Delivery records and their attempt history are never "
+            "deleted; they are unlinked from the submission and left in place."
+        ),
+    )
+    cleanup.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be deleted and change nothing.",
+    )
+    cleanup.add_argument(
+        "--older-than-days",
+        type=int,
+        metavar="DAYS",
+        help=(
+            "Delete submissions older than this many days, instead of the configured "
+            "retention. Required when no retention is configured."
+        ),
+    )
+    cleanup.add_argument(
+        "--batch-size",
+        type=int,
+        default=retention.DEFAULT_BATCH_SIZE,
+        metavar="ROWS",
+        help=(
+            "How many submissions to delete per transaction. "
+            f"Defaults to {retention.DEFAULT_BATCH_SIZE}."
+        ),
+    )
+
     return parser
 
 
@@ -129,16 +177,19 @@ def _run(arguments: argparse.Namespace, settings: Settings, *, out: TextIO) -> i
         # understand.
         verify_schema(engine)
         with create_session_factory(engine)() as session:
-            return _dispatch(arguments, session, out=out)
+            return _dispatch(arguments, session, settings, out=out)
     finally:
         engine.dispose()
 
 
-def _dispatch(arguments: argparse.Namespace, session: Session, *, out: TextIO) -> int:
+def _dispatch(
+    arguments: argparse.Namespace, session: Session, settings: Settings, *, out: TextIO
+) -> int:
     """
     run the chosen command against an open session
     :param arguments: the parsed command line
     :param session: the session to do the work through
+    :param settings: the configuration this invocation was built from
     :param out: the stream ordinary output is written to
     :returns: the process exit code
     """
@@ -146,6 +197,8 @@ def _dispatch(arguments: argparse.Namespace, session: Session, *, out: TextIO) -
         return _create_key(session, name=arguments.name, out=out)
     if arguments.command == "list-keys":
         return _list_keys(session, out=out)
+    if arguments.command == "cleanup-submissions":
+        return _cleanup_submissions(session, settings, arguments, out=out)
     return _revoke_key(session, key_id=arguments.key_id, out=out)
 
 
@@ -244,6 +297,97 @@ def _revoke_key(session: Session, *, key_id: str, out: TextIO) -> int:
         file=out,
     )
     return EXIT_OK
+
+
+def _cleanup_submissions(
+    session: Session,
+    settings: Settings,
+    arguments: argparse.Namespace,
+    *,
+    out: TextIO,
+) -> int:
+    """
+    delete stored submissions that have outlived their retention
+    :param session: the session to write through
+    :param settings: the configuration naming the retention age
+    :param arguments: the parsed command line, read for the run's options
+    :param out: the stream ordinary output is written to
+    :returns: the process exit code
+    """
+    policy = _cleanup_policy(settings, arguments.older_than_days)
+    if policy is None:
+        # Refused rather than treated as "delete nothing", so an operator who
+        # expected a sweep to happen finds out that it did not.
+        print(
+            "No submission retention is configured, so nothing is eligible for deletion. "
+            "Set FORMS_SUBMISSION_RETENTION_DAYS, or pass --older-than-days to sweep "
+            "this once without configuring anything.",
+            file=sys.stderr,
+        )
+        return EXIT_FAILED
+    if arguments.batch_size < 1:
+        print("--batch-size must be at least 1.", file=sys.stderr)
+        return EXIT_FAILED
+
+    cutoff = policy.cutoff(utcnow())
+    eligible = storage.count_expired_submissions(session, before=cutoff)
+
+    print(
+        f"Retention keeps submissions for {policy.days} days, so the cutoff is {_moment(cutoff)}.",
+        file=out,
+    )
+    print(
+        f"{eligible} submission(s) received before then are eligible for deletion. "
+        "A submission whose delivery is still pending, processing or replayable is "
+        "not eligible, however old it is.",
+        file=out,
+    )
+
+    if arguments.dry_run:
+        # Nothing above this line wrote anything, and nothing below it runs. The
+        # counting query is the whole of what a dry run does.
+        print("Dry run: nothing was deleted.", file=out)
+        return EXIT_OK
+    if eligible == 0:
+        print("Nothing to delete.", file=out)
+        return EXIT_OK
+
+    removed = storage.delete_expired_submissions(
+        session,
+        before=cutoff,
+        batch_size=arguments.batch_size,
+        max_batches=retention.MAX_BATCHES,
+    )
+    print(
+        f"Deleted {removed} submission(s) in batches of up to {arguments.batch_size}. "
+        "Delivery records and their attempt history were left in place.",
+        file=out,
+    )
+    if removed < eligible:
+        # Either this run hit its batch ceiling, or a delivery finished between
+        # the count and the sweep and took its submission out of scope. Both are
+        # answered the same way: run it again.
+        print(
+            "Fewer were deleted than were counted. Run the command again to continue.",
+            file=out,
+        )
+    return EXIT_OK
+
+
+def _cleanup_policy(settings: Settings, older_than_days: int | None) -> RetentionPolicy | None:
+    """
+    work out which retention age this run should sweep against
+    :param settings: the configuration naming the retention age
+    :param older_than_days: an age given on the command line, or None if there was none
+    :returns: the policy to sweep with, or None if nothing is eligible under either
+    """
+    # An explicit age on the command line wins, which is what lets an operator
+    # who keeps submissions indefinitely still clear out one old range by hand.
+    if older_than_days is not None:
+        chosen = RetentionPolicy(days=older_than_days)
+    else:
+        chosen = settings.retention_policy()
+    return chosen if chosen.enabled else None
 
 
 def _revocation_moment(session: Session, key_id: str) -> datetime | None:

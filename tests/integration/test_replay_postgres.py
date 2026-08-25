@@ -70,7 +70,7 @@ def test_two_operators_replaying_at_once_do_not_both_win(
     # than the one it hoped for, so its answer is the same however the race went.
     loser = first if not first.requeued else second
     assert loser.record is not None
-    assert loser.record.delivery.state == DeliveryState.PENDING
+    assert loser.record.state == DeliveryState.PENDING
 
 
 def test_a_concurrent_replay_duplicates_no_work(sessions: sessionmaker[Session]) -> None:
@@ -131,7 +131,7 @@ def test_a_delivery_that_was_never_failed_is_refused(sessions: sessionmaker[Sess
 
     assert outcome.requeued is False
     assert outcome.record is not None
-    assert outcome.record.delivery.state == DeliveryState.DELIVERED
+    assert outcome.record.state == DeliveryState.DELIVERED
 
 
 def test_replay_over_http_answers_from_the_settled_state(

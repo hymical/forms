@@ -44,10 +44,15 @@ An unknown `state` is refused with `422 invalid_request`. An `endpoint_id` that
 matches nothing is not an error: it is a filter that selected no rows, and the
 answer is an empty page.
 
-!!! note "Submitted field values are never returned"
+!!! note "A delivery view carries no submitted field values"
 
-    Not in the listing and not in the detail. There is no route that reads a
-    submission back, and a delivery view is not a way around that.
+    Not in the listing and not in the detail. To see what a delivery was
+    carrying, take its `submission_id` to
+    [`GET /submissions/{id}`](../api/submission-management.md).
+
+`submission_id` is `null` when [retention](../operations/retention.md) has removed
+the submission. That only ever happens to a delivery that already succeeded: a
+failed delivery keeps its submission precisely so that it stays replayable.
 
 ## One delivery, with its attempt history
 

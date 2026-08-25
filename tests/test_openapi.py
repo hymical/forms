@@ -26,6 +26,9 @@ MANAGEMENT_OPERATIONS = [
     ("/deliveries", "get"),
     ("/deliveries/{delivery_id}", "get"),
     ("/deliveries/{delivery_id}/replay", "post"),
+    ("/submissions", "get"),
+    ("/submissions/export", "get"),
+    ("/submissions/{submission_id}", "get"),
 ]
 
 PUBLIC_OPERATIONS = [
@@ -144,5 +147,32 @@ def test_the_delivery_views_carry_no_submitted_fields(client: TestClient) -> Non
 def test_a_page_response_has_the_shared_shape(client: TestClient) -> None:
     components = schema(client)["components"]["schemas"]
 
-    for name in ("EndpointPage", "DeliveryPage"):
+    for name in ("EndpointPage", "DeliveryPage", "SubmissionPage"):
         assert set(components[name]["properties"]) == {"items", "next_cursor"}, name
+
+
+def test_a_submission_listing_cannot_name_the_submitted_values(client: TestClient) -> None:
+    """
+    a summary model with no fields property cannot leak one however the route changes
+    :param client: test client whose app holds the default endpoint
+    """
+    components = schema(client)["components"]["schemas"]
+
+    assert "fields" not in components["SubmissionSummary"]["properties"]
+    # The detail model is the one that is meant to carry them.
+    assert "fields" in components["SubmissionDetail"]["properties"]
+
+
+def test_no_submission_response_exposes_an_internal_column(client: TestClient) -> None:
+    components = schema(client)["components"]["schemas"]
+
+    for name in ("SubmissionSummary", "SubmissionDetail", "SubmissionExport"):
+        properties = set(components[name]["properties"])
+        assert "payload_fingerprint" not in properties, name
+        assert "idempotency_key" not in properties, name
+
+
+def test_the_export_route_documents_both_formats(client: TestClient) -> None:
+    content = operation(client, "/submissions/export", "get")["responses"]["200"]["content"]
+
+    assert set(content) == {"application/json", "text/csv"}

@@ -59,6 +59,10 @@ crash cannot lose work the service already acknowledged.
 - **Management API keys**, created by an operator CLI and stored only as digests
 - **Endpoint and delivery operations**: reconfigure, inspect attempt history,
   replay a failed delivery
+- **Submission retrieval and export**: browse, filter by endpoint and time, read
+  one back, export a filtered range as JSON or CSV
+- **Retention cleanup** driven by an operator command, which never deletes a
+  submission a delivery could still need
 - **Distributed rate limiting** on public ingestion, per source address and per
   endpoint, shared across API processes
 - **Alembic migrations** with a startup revision check and model drift tests
@@ -142,10 +146,11 @@ Full walkthrough:
 | Section | Covers |
 | --- | --- |
 | [Getting Started](https://hymical.github.io/forms/getting-started/installation/) | Install, configure, migrate, first submission |
-| [Guides](https://hymical.github.io/forms/guides/form-ingestion/) | Ingestion, idempotency, webhooks, rate limiting, endpoints, replay |
+| [Guides](https://hymical.github.io/forms/guides/form-ingestion/) | Ingestion, idempotency, webhooks, rate limiting, endpoints, replay, submissions, export |
 | [API Reference](https://hymical.github.io/forms/api/authentication/) | Every route, its parameters and responses, and the complete error table |
-| [Operations](https://hymical.github.io/forms/operations/worker/) | Worker, migrations, reverse proxy, every configuration variable |
+| [Operations](https://hymical.github.io/forms/operations/worker/) | Worker, migrations, retention, reverse proxy, every configuration variable |
 | [Architecture](https://hymical.github.io/forms/architecture/overview/) | Transactional outbox, delivery semantics, concurrency, security |
+| [Data handling](https://hymical.github.io/forms/reference/data-handling/) | Where submitted values go, and where they never go |
 | [Limitations](https://hymical.github.io/forms/reference/limitations/) | An honest list of what this build does not do yet |
 
 ## Project status
@@ -165,18 +170,24 @@ concurrency.
 | Delivery inspection and manual replay | Implemented |
 | Public ingestion rate limiting | Implemented |
 | Schema migrations | Implemented |
-| Submission retrieval, export, retention | **Not implemented** |
+| Submission retrieval and filtering | Implemented |
+| Submission export, JSON and CSV | Implemented |
+| Retention cleanup, operator-run | Implemented |
+| Scheduled retention | **Not implemented** |
+| Submission search | **Not implemented** |
 | Endpoint deletion | **Not implemented** |
 | Spam handling, CAPTCHA | **Not implemented** |
 | Dashboards | **Not implemented** |
 
-Three things are worth knowing before you deploy it:
+Four things are worth knowing before you deploy it:
 
 - **Delivery is at-least-once, not exactly-once.** Deduplicate on the submission
   `id` in the signed payload.
 - **Rate limiting is traffic protection, not spam protection.** It bounds volume
   and has no opinion about content.
 - **SSRF protection is partial.** Webhook hostnames are not resolved.
+- **Nothing is deleted until you delete it.** Retention is a command an operator
+  runs, and it never removes a submission a delivery could still need.
 
 The full list is in
 [Limitations](https://hymical.github.io/forms/reference/limitations/).

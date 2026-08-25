@@ -77,9 +77,11 @@ fingerprint, so an honest retry always matches.
 A key belongs to **one endpoint**. The same key may be used once per endpoint
 without conflicting.
 
-There is no expiry: a key is spent for as long as its submission is stored. That
-is a known limitation, and it belongs with retention, which is not implemented.
-See [Limitations](../reference/limitations.md).
+A key has no expiry of its own: it is spent for as long as its submission is
+stored, because the uniqueness constraint lives on that row. Configuring
+[retention](../operations/retention.md) is therefore what eventually releases
+one, and without it the table only grows. Retention ages are far longer than any
+client's retry window, so this is bookkeeping rather than a behaviour change.
 
 ## Key format
 

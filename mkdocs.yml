@@ -94,15 +94,19 @@ nav:
       - Rate Limiting: guides/rate-limiting.md
       - Endpoint Management: guides/endpoint-management.md
       - Delivery Replay: guides/delivery-replay.md
+      - Browsing Submissions: guides/submission-management.md
+      - Exporting Submissions: guides/exporting-submissions.md
   - API Reference:
       - Authentication: api/authentication.md
       - Endpoints: api/endpoints.md
       - Submissions: api/submissions.md
+      - Submission Management: api/submission-management.md
       - Deliveries: api/deliveries.md
       - Errors: api/errors.md
   - Operations:
       - Worker: operations/worker.md
       - Database Migrations: operations/migrations.md
+      - Submission Retention: operations/retention.md
       - Reverse Proxy: operations/reverse-proxy.md
       - Configuration Reference: operations/configuration-reference.md
   - Architecture:
@@ -115,4 +119,5 @@ nav:
       - Testing: development/testing.md
       - Contributing: development/contributing.md
   - Reference:
+      - Data Handling: reference/data-handling.md
       - Limitations: reference/limitations.md

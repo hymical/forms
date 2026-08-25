@@ -12,6 +12,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from hymical_forms.ratelimit import RateLimit
+from hymical_forms.retention import RetentionPolicy
 from hymical_forms.webhooks import RetryPolicy
 
 
@@ -157,6 +158,26 @@ class Settings(BaseSettings):
         ),
     )
 
+    submission_retention_days: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "How many days a stored submission is kept before an operator's cleanup "
+            "command may delete it. 0, the default, keeps submissions indefinitely. "
+            "Nothing is ever deleted automatically: the sweep is a command an operator "
+            "runs deliberately."
+        ),
+    )
+    export_max_submissions: int = Field(
+        default=10_000,
+        ge=1,
+        description=(
+            "Largest number of submissions one export may return. A filter matching "
+            "more than this is refused rather than silently truncated, so an export is "
+            "either complete or an error."
+        ),
+    )
+
     def retry_policy(self) -> RetryPolicy:
         """
         gather the retry settings into the value the delivery code works with
@@ -187,3 +208,10 @@ class Settings(BaseSettings):
             requests=self.rate_limit_endpoint_requests,
             window_seconds=self.rate_limit_endpoint_window_seconds,
         )
+
+    def retention_policy(self) -> RetentionPolicy:
+        """
+        gather the retention setting into the value the cleanup command works with
+        :returns: the configured retention policy
+        """
+        return RetentionPolicy(days=self.submission_retention_days)

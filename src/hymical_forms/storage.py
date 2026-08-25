@@ -12,27 +12,41 @@ record and the state it justifies have to land together; :func:`update_endpoint`
 and :func:`requeue_failed_delivery`, because each is the whole of what its
 management request came to do; the two management key writes,
 :func:`revoke_management_key` and :func:`record_management_key_use`, for the
-same reason; and the two rate limit operations, :func:`consume_rate_limit` and
+same reason; the two rate limit operations, :func:`consume_rate_limit` and
 :func:`delete_expired_rate_limit_counters`, because abuse accounting has to
-outlive the request it was accounting for.
+outlive the request it was accounting for; and
+:func:`delete_expired_submissions`, because a retention sweep is deliberately
+many small committed batches rather than one long transaction.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, TypeVar, cast
 
-from sqlalchemy import ColumnElement, Select, and_, delete, or_, select, tuple_, update
+from sqlalchemy import (
+    ColumnElement,
+    Select,
+    and_,
+    delete,
+    func,
+    or_,
+    select,
+    tuple_,
+    update,
+)
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Mapped, Session
 
 from hymical_forms import models
 from hymical_forms.ingestion import Submission
 from hymical_forms.ratelimit import Limiter
+from hymical_forms.retention import PROTECTED_DELIVERY_STATES
 from hymical_forms.webhooks import (
     DeliveryOutcome,
     DeliveryResult,
@@ -44,10 +58,20 @@ from hymical_forms.webhooks import (
     new_webhook_delivery_id,
 )
 
-# The two tables management routes page through. Both are keyed by an opaque
-# identifier and carry a creation timestamp, which is all cursor pagination here
-# asks of a table.
-_Paged = TypeVar("_Paged", models.Endpoint, models.WebhookDelivery)
+# The three tables management routes page through. Each is keyed by an opaque
+# identifier and carries a timestamp it is ordered by, which is all cursor
+# pagination here asks of a table. Which timestamp differs, so callers name it.
+_Paged = TypeVar("_Paged", models.Endpoint, models.WebhookDelivery, models.Submission)
+
+# Any submission select, whatever it happens to be selecting. The submission
+# filters are applied to a listing, an export and a bounded count alike, and
+# narrowing a select never changes what it returns.
+_Statement = TypeVar("_Statement", bound=Select[Any])
+
+# How many rows a streamed export pulls from the server at a time. Bounded so
+# that an export builds its response as it goes rather than materialising every
+# matching row before the first byte is written.
+EXPORT_FETCH_SIZE = 200
 
 
 class UnknownCursor(Exception):
@@ -140,7 +164,9 @@ def list_endpoints(
     endpoint = models.Endpoint
     statement = select(endpoint).order_by(endpoint.created_at.desc(), endpoint.id.desc())
     if after is not None:
-        statement = statement.where(_page_after(session, endpoint, after))
+        statement = statement.where(
+            _page_after(session, endpoint, after, ordered_by=endpoint.created_at)
+        )
     return list(session.scalars(statement.limit(limit)))
 
 
@@ -335,6 +361,7 @@ def _add_submission(
         models.WebhookDelivery(
             id=new_webhook_delivery_id(),
             submission_id=submission.id,
+            endpoint_id=submission.endpoint_id,
             destination_url=webhook.url,
             signing_secret=webhook.secret,
             state=DeliveryState.PENDING,
@@ -347,6 +374,224 @@ def _add_submission(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class SubmissionFilter:
+    """
+    the bounded set of stored submissions a management read is asking for
+    """
+
+    # Both bounds are exclusive, which is the contract the API documents. Kept
+    # together in one value so that the listing, the export and the count that
+    # guards the export cannot end up asking three slightly different questions.
+    endpoint_id: str | None = None
+    received_after: datetime | None = None
+    received_before: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SubmissionRecord:
+    """
+    a stored submission together with the delivery it owes, if it owes one
+    """
+
+    # There is at most one delivery per submission, enforced by a unique
+    # constraint, so this is a value rather than a list. It is None for a
+    # submission whose endpoint has no webhook.
+    submission: models.Submission
+    delivery: models.WebhookDelivery | None
+
+
+def list_submissions(
+    session: Session,
+    *,
+    filters: SubmissionFilter,
+    limit: int,
+    after: str | None = None,
+) -> list[SubmissionRecord]:
+    """
+    read one page of stored submissions, newest first
+    :param session: the session to query through
+    :param filters: the endpoint and time bounds to narrow the page to
+    :param limit: the most submissions to return
+    :param after: identifier of the last submission on the previous page, or None to start
+    :returns: the page, at most ``limit`` long
+    :raises UnknownCursor: if ``after`` does not name an existing submission
+    """
+    submission = models.Submission
+    delivery = models.WebhookDelivery
+    statement = (
+        # An outer join, because a submission to an endpoint with no webhook owes
+        # no delivery and must still be listed. One join rather than a lookup per
+        # row, and it rides the unique constraint on the delivery's submission.
+        select(submission, delivery)
+        .outerjoin(delivery, delivery.submission_id == submission.id)
+        .order_by(submission.received_at.desc(), submission.id.desc())
+    )
+    statement = _narrowed(statement, filters)
+    if after is not None:
+        statement = statement.where(
+            _page_after(session, submission, after, ordered_by=submission.received_at)
+        )
+
+    return [SubmissionRecord(row, owed) for row, owed in session.execute(statement.limit(limit))]
+
+
+def get_submission(session: Session, submission_id: str) -> SubmissionRecord | None:
+    """
+    look one stored submission up by its identifier
+    :param session: the session to query through
+    :param submission_id: the identifier to resolve
+    :returns: the submission and its delivery, or None if no submission holds that identifier
+    """
+    submission = models.Submission
+    delivery = models.WebhookDelivery
+    row = session.execute(
+        select(submission, delivery)
+        .outerjoin(delivery, delivery.submission_id == submission.id)
+        .where(submission.id == submission_id)
+    ).one_or_none()
+    return SubmissionRecord(row[0], row[1]) if row is not None else None
+
+
+def count_submissions(session: Session, *, filters: SubmissionFilter, ceiling: int) -> int:
+    """
+    count the matching submissions, giving up once a ceiling is reached
+    :param session: the session to query through
+    :param filters: the endpoint and time bounds to count within
+    :param ceiling: the most rows to count before stopping
+    :returns: the number of matches, or ``ceiling`` when there are at least that many
+    """
+    # Counting through a bounded subquery rather than counting the table, so a
+    # filter matching millions costs a walk of ``ceiling`` index entries and not
+    # a walk of everything. The caller only needs to know whether the export fits.
+    bounded = _narrowed(select(models.Submission.id), filters).limit(ceiling).subquery()
+    return cast(int, session.scalar(select(func.count()).select_from(bounded)))
+
+
+def stream_submissions(
+    session: Session, *, filters: SubmissionFilter, limit: int
+) -> Iterator[models.Submission]:
+    """
+    read the matching submissions in export order, a chunk at a time
+    :param session: the session to query through
+    :param filters: the endpoint and time bounds to export within
+    :param limit: the most submissions to yield, whatever the filter matches
+    :returns: an iterator over the matching submissions, newest first
+    """
+    # ``yield_per`` is what makes this a stream rather than a list wearing an
+    # iterator's clothes: rows arrive from the server in chunks, so an export
+    # writes its first bytes without every matching row being in memory. The
+    # limit is still applied, so even a runaway cursor is bounded.
+    submission = models.Submission
+    statement = _narrowed(
+        select(submission).order_by(submission.received_at.desc(), submission.id.desc()),
+        filters,
+    ).limit(limit)
+    return iter(session.scalars(statement.execution_options(yield_per=EXPORT_FETCH_SIZE)))
+
+
+def count_expired_submissions(session: Session, *, before: datetime) -> int:
+    """
+    count the submissions a retention sweep would delete
+    :param session: the session to query through
+    :param before: submissions received strictly before this instant are eligible
+    :returns: how many submissions are eligible for deletion
+    """
+    return cast(
+        int,
+        session.scalar(
+            select(func.count()).select_from(models.Submission).where(_expired_condition(before))
+        ),
+    )
+
+
+def delete_expired_submissions(
+    session: Session, *, before: datetime, batch_size: int, max_batches: int
+) -> int:
+    """
+    delete eligible submissions in committed batches until none are left
+    :param session: the session to write through
+    :param before: submissions received strictly before this instant are eligible
+    :param batch_size: the most submissions to remove in one transaction
+    :param max_batches: the most batches this run will do before stopping
+    :returns: how many submissions were deleted
+    """
+    # Many short transactions rather than one long one. A single DELETE over a
+    # large backlog would hold locks on every row it touched for as long as the
+    # whole sweep took; this way each batch is committed and released, and a run
+    # that is interrupted has still durably removed everything it reported.
+    #
+    # The eligible identifiers are read first and deleted by identifier, so the
+    # delete is a primary key lookup and the eligibility test is evaluated once
+    # rather than being re-planned inside a delete.
+    removed = 0
+    for _ in range(max_batches):
+        ids = list(
+            session.scalars(
+                select(models.Submission.id).where(_expired_condition(before)).limit(batch_size)
+            )
+        )
+        if not ids:
+            break
+
+        # The delivery and the attempts that referenced these submissions are not
+        # touched. Their foreign keys are ``ON DELETE SET NULL``, so the database
+        # unlinks them and leaves the operational history standing.
+        result = cast(
+            "CursorResult[Any]",
+            session.execute(
+                delete(models.Submission)
+                .where(models.Submission.id.in_(ids))
+                .execution_options(synchronize_session=False)
+            ),
+        )
+        session.commit()
+        removed += result.rowcount
+        if len(ids) < batch_size:
+            break
+
+    return removed
+
+
+def _expired_condition(before: datetime) -> ColumnElement[bool]:
+    """
+    build the test for a submission a retention sweep may delete
+    :param before: submissions received strictly before this instant are eligible
+    :returns: a SQL condition matching only submissions nothing still needs
+    """
+    # Old enough, and not carrying a delivery that could still be attempted. The
+    # payload is built from the submission at send time, so a pending, processing
+    # or replayable failed delivery would be left with nothing to send. A
+    # submission with no delivery, and one whose delivery is already delivered,
+    # both pass, because nothing will read their fields again.
+    delivery = models.WebhookDelivery
+    still_needed = select(delivery.id).where(
+        delivery.submission_id == models.Submission.id,
+        delivery.state.in_(PROTECTED_DELIVERY_STATES),
+    )
+    return and_(models.Submission.received_at < before, ~still_needed.exists())
+
+
+def _narrowed(statement: _Statement, filters: SubmissionFilter) -> _Statement:
+    """
+    apply the endpoint and time bounds a management read asked for
+    :param statement: the select to narrow
+    :param filters: the endpoint and time bounds to apply
+    :returns: the same select, narrowed
+    """
+    # Both time bounds are strict. An operator paging forward by passing the last
+    # timestamp back as ``received_after`` gets the next submissions rather than
+    # the one they already have, which is the behaviour the API documents.
+    submission = models.Submission
+    if filters.endpoint_id is not None:
+        statement = statement.where(submission.endpoint_id == filters.endpoint_id)
+    if filters.received_after is not None:
+        statement = statement.where(submission.received_at > filters.received_after)
+    if filters.received_before is not None:
+        statement = statement.where(submission.received_at < filters.received_before)
+    return statement
+
+
 def due_condition(now: datetime) -> ColumnElement[bool]:
     """
     build the test for a delivery a worker is allowed to pick up
@@ -356,10 +601,19 @@ def due_condition(now: datetime) -> ColumnElement[bool]:
     # Two ways to be claimable: waiting and due, or claimed by a worker whose
     # lease has run out. The second is what recovers work from a worker that died
     # holding a job, rather than leaving it stuck in ``processing`` forever.
+    #
+    # A delivery with no submission is never due, whichever state it is in. The
+    # payload is built from the submission at send time, so a delivery without
+    # one has nothing to send. Retention can only unlink a delivery that has
+    # already been delivered, which this condition excludes anyway; the test is
+    # here so that the guarantee is the query's rather than the sweep's.
     delivery = models.WebhookDelivery
-    return or_(
-        and_(delivery.state == DeliveryState.PENDING, delivery.next_attempt_at <= now),
-        and_(delivery.state == DeliveryState.PROCESSING, delivery.claim_expires_at <= now),
+    return and_(
+        delivery.submission_id.is_not(None),
+        or_(
+            and_(delivery.state == DeliveryState.PENDING, delivery.next_attempt_at <= now),
+            and_(delivery.state == DeliveryState.PROCESSING, delivery.claim_expires_at <= now),
+        ),
     )
 
 
@@ -408,18 +662,30 @@ def claim_due_deliveries(
     return claimed
 
 
-def load_submissions(session: Session, submission_ids: list[str]) -> dict[str, Submission]:
+def load_submissions(
+    session: Session, deliveries: list[models.WebhookDelivery]
+) -> dict[str, Submission]:
     """
-    load the submissions a batch of deliveries is carrying
+    load the submission each claimed delivery is carrying
     :param session: the session to query through
-    :param submission_ids: the submissions to fetch
-    :returns: the submissions in domain form, keyed by id
+    :param deliveries: the deliveries a worker has just claimed
+    :returns: the submissions in domain form, keyed by the delivery that carries each one
     """
+    # Keyed by delivery rather than by submission, because the delivery is what
+    # the caller is holding and because the link between them is now nullable.
+    # Nothing due can have lost its submission, since only a delivered delivery
+    # is ever unlinked and a delivered delivery is not claimable, so this filter
+    # states that rather than relying on it.
+    carried = {job.id: job.submission_id for job in deliveries if job.submission_id is not None}
+
     # One query for the batch rather than a lookup per delivery.
-    rows = session.scalars(
-        select(models.Submission).where(models.Submission.id.in_(submission_ids))
-    )
-    return {row.id: row.to_domain() for row in rows}
+    rows = {
+        row.id: row.to_domain()
+        for row in session.scalars(
+            select(models.Submission).where(models.Submission.id.in_(carried.values()))
+        )
+    }
+    return {job_id: rows[submission_id] for job_id, submission_id in carried.items()}
 
 
 def complete_attempt(
@@ -483,19 +749,6 @@ def complete_attempt(
     return attempt
 
 
-@dataclass(frozen=True, slots=True)
-class DeliveryRecord:
-    """
-    a delivery together with the endpoint whose submission it carries
-    """
-
-    # The endpoint is not a column on the delivery: it is reached through the
-    # submission. Carrying it alongside means a management response can report
-    # which endpoint a delivery belongs to without a second query per row.
-    delivery: models.WebhookDelivery
-    endpoint_id: str
-
-
 def list_deliveries(
     session: Session,
     *,
@@ -503,7 +756,7 @@ def list_deliveries(
     after: str | None = None,
     endpoint_id: str | None = None,
     state: str | None = None,
-) -> list[DeliveryRecord]:
+) -> list[models.WebhookDelivery]:
     """
     read one page of the delivery queue, newest first
     :param session: the session to query through
@@ -514,31 +767,31 @@ def list_deliveries(
     :returns: the page, at most ``limit`` long
     :raises UnknownCursor: if ``after`` does not name an existing delivery
     """
+    # No join. The endpoint is a column on the delivery, so a delivery whose
+    # submission has been retained away is still listed, still says which
+    # endpoint it belonged to, and is still reachable through this filter.
     delivery = models.WebhookDelivery
-    statement = _delivery_query().order_by(delivery.created_at.desc(), delivery.id.desc())
+    statement = select(delivery).order_by(delivery.created_at.desc(), delivery.id.desc())
     if endpoint_id is not None:
-        statement = statement.where(models.Submission.endpoint_id == endpoint_id)
+        statement = statement.where(delivery.endpoint_id == endpoint_id)
     if state is not None:
         statement = statement.where(delivery.state == state)
     if after is not None:
-        statement = statement.where(_page_after(session, delivery, after))
+        statement = statement.where(
+            _page_after(session, delivery, after, ordered_by=delivery.created_at)
+        )
 
-    return [
-        DeliveryRecord(row, endpoint) for row, endpoint in session.execute(statement.limit(limit))
-    ]
+    return list(session.scalars(statement.limit(limit)))
 
 
-def get_delivery(session: Session, delivery_id: str) -> DeliveryRecord | None:
+def get_delivery(session: Session, delivery_id: str) -> models.WebhookDelivery | None:
     """
     look one delivery up by its identifier
     :param session: the session to query through
     :param delivery_id: the identifier to resolve
-    :returns: the delivery and its endpoint, or None if no delivery holds that identifier
+    :returns: the delivery, or None if no delivery holds that identifier
     """
-    row = session.execute(
-        _delivery_query().where(models.WebhookDelivery.id == delivery_id)
-    ).one_or_none()
-    return DeliveryRecord(row[0], row[1]) if row is not None else None
+    return session.get(models.WebhookDelivery, delivery_id)
 
 
 def list_delivery_attempts(session: Session, delivery_id: str) -> list[models.DeliveryAttempt]:
@@ -570,7 +823,7 @@ class ReplayOutcome:
     # ``record`` is None only when the delivery does not exist. ``requeued`` is
     # False for a delivery that was not failed, which includes the loser of two
     # simultaneous replays: it reads back the pending delivery the winner made.
-    record: DeliveryRecord | None
+    record: models.WebhookDelivery | None
     requeued: bool
 
 
@@ -615,16 +868,6 @@ def requeue_failed_delivery(session: Session, delivery_id: str, *, now: datetime
     # Read after the commit, so both the winner and the loser describe the state
     # the database actually settled on rather than the one they hoped for.
     return ReplayOutcome(get_delivery(session, delivery_id), requeued=result.rowcount == 1)
-
-
-def _delivery_query() -> Select[tuple[models.WebhookDelivery, str]]:
-    """
-    build the read every delivery management route starts from
-    :returns: a select of deliveries joined to the endpoint they belong to
-    """
-    return select(models.WebhookDelivery, models.Submission.endpoint_id).join(
-        models.Submission, models.Submission.id == models.WebhookDelivery.submission_id
-    )
 
 
 def create_management_key(
@@ -856,16 +1099,26 @@ def _upsert_for(session: Session) -> Any:
     raise UnsupportedRateLimitBackend(dialect)
 
 
-def _page_after(session: Session, model: type[_Paged], cursor: str) -> ColumnElement[bool]:
+def _page_after(
+    session: Session,
+    model: type[_Paged],
+    cursor: str,
+    *,
+    ordered_by: Mapped[datetime],
+) -> ColumnElement[bool]:
     """
     build the test for rows that come after a cursor, in newest-first order
     :param session: the session to resolve the cursor through
     :param model: the table being paged
     :param cursor: the identifier of the last row on the previous page
+    :param ordered_by: the timestamp column the page is ordered by, newest first
     :returns: a SQL condition matching only the rows that follow it
     :raises UnknownCursor: if the cursor does not name an existing row
     """
-    anchor = session.get(model, cursor)
+    # The anchor's ordering value is read through the column the caller named
+    # rather than off a loaded row, so this works for any table without knowing
+    # what its timestamp is called.
+    anchor = session.execute(select(ordered_by, model.id).where(model.id == cursor)).one_or_none()
     if anchor is None:
         # Refused rather than treated as the first page, so a caller that pages
         # past a row somebody deleted learns about it instead of silently
@@ -876,7 +1129,7 @@ def _page_after(session: Session, model: type[_Paged], cursor: str) -> ColumnEle
     # rather than two that have to be kept in agreement. Both timestamps and both
     # identifiers are compared, which is what makes a page boundary total even
     # when several rows were created in the same transaction.
-    return tuple_(model.created_at, model.id) < (anchor.created_at, anchor.id)
+    return tuple_(ordered_by, model.id) < (anchor[0], anchor[1])
 
 
 def _settle(existing: models.Submission, payload_fingerprint: str | None) -> Submission:

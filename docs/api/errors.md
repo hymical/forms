@@ -27,6 +27,7 @@ names or SQL.
 | 404 | `invalid_endpoint_id` | Submission path is not a well-formed endpoint ID |
 | 404 | `endpoint_not_found` | Endpoint ID is well formed but no such endpoint exists |
 | 404 | `delivery_not_found` | No delivery with that ID exists |
+| 404 | `submission_not_found` | No submission with that ID exists |
 | 404 | `not_found` | Unknown path |
 | 405 | `method_not_allowed` | Wrong method for a known path |
 | 409 | `endpoint_inactive` | Endpoint exists but is not accepting submissions |
@@ -40,6 +41,9 @@ names or SQL.
 | 422 | `invalid_endpoint_id` | Endpoint ID in a request body breaks the ID rules |
 | 422 | `invalid_request` | Request body or query parameters failed schema validation |
 | 422 | `invalid_webhook_url` | Webhook destination is malformed or not permitted |
+| 422 | `invalid_time_range` | `received_after` is not strictly earlier than `received_before` |
+| 422 | `export_too_large` | An export matches more than `FORMS_EXPORT_MAX_SUBMISSIONS` |
+| 422 | `unsupported_export_format` | Export `format` is not `json` or `csv` |
 | 422 | `file_upload_not_supported` | A multipart part carried a file |
 | 422 | ingestion rule codes | See below |
 | 429 | `rate_limit_exceeded` | A public ingestion rate limit was exhausted |
@@ -86,6 +90,20 @@ not permitted, which needs a permission model this build does not have.
 alike, so that a guesser cannot sort their attempts into "nearly right" and
 "wrong". The credential a request sent is never echoed back in an error.
 
+### `export_too_large` is a `422`, not a `413`
+
+The request is well formed, and what has to change is the filter, which is part
+of the request. It is refused rather than truncated so that an export is either
+everything that matched or an error, never a quietly incomplete file. See
+[Exporting submissions](../guides/exporting-submissions.md#size-limit).
+
+### `invalid_time_range` is refused, an empty match is not
+
+A filter matching nothing is an empty page, because that is a fact about the
+data. A range where `received_after` is on or after `received_before` can never
+match anything at all, which is a mistake in the request; answering it with an
+empty page would hide the mistake.
+
 ### `storage_unavailable` rather than `500`
 
 A database failure returns `503`, because the request itself was fine and
@@ -101,5 +119,5 @@ published.
 
 ## Related
 
-- [Submissions](submissions.md), [Endpoints](endpoints.md) and [Deliveries](deliveries.md) for which codes each route can return
+- [Submissions](submissions.md), [Endpoints](endpoints.md), [Deliveries](deliveries.md) and [Submission Management](submission-management.md) for which codes each route can return
 - [Authentication](authentication.md) for the `401` cases

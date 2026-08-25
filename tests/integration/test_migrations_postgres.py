@@ -12,6 +12,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 
+import pytest
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
@@ -98,6 +99,7 @@ def test_the_migration_creates_the_constraints_the_application_relies_on(
         "ck_webhook_deliveries_completion",
         "fk_submissions_endpoint_id_endpoints",
         "fk_webhook_deliveries_submission_id_submissions",
+        "fk_webhook_deliveries_endpoint_id_endpoints",
         "fk_delivery_attempts_delivery_id_webhook_deliveries",
         "fk_delivery_attempts_submission_id_submissions",
     } <= names
@@ -440,7 +442,7 @@ def test_a_populated_0003_survives_the_whole_round_trip(postgres_url: str) -> No
 
         command.upgrade(config, "0004")
         command.downgrade(config, "0003")
-        command.upgrade(config, "0004")
+        command.upgrade(config, "head")
 
         assert current_revision(engine) == head_revision()
         with engine.connect() as connection:
@@ -451,6 +453,219 @@ def test_a_populated_0003_survives_the_whole_round_trip(postgres_url: str) -> No
                     {"id": SEEDED_DELIVERY},
                 )
                 == 1
+            )
+            difference = compare_metadata(MigrationContext.configure(connection), Base.metadata)
+        assert difference == [], f"migrated schema differs from the models: {difference}"
+
+
+# --- the retention schema 0005 introduced ------------------------------------
+#
+# 0005 is the first revision that loosens a constraint rather than adding one, so
+# what it has to prove is that the loosening is deliberate and that the column it
+# backfills ends up holding what the join it replaces used to produce.
+
+
+def test_upgrading_a_populated_0004_backfills_the_delivery_endpoint(postgres_url: str) -> None:
+    """
+    the column that replaces a join must arrive holding what the join produced
+    :param postgres_url: a URL on the PostgreSQL server to work against
+    """
+    with _database_at_baseline(postgres_url) as (config, engine):
+        with engine.begin() as connection:
+            _seed_baseline_data(connection)
+        command.upgrade(config, "0004")
+
+        command.upgrade(config, "0005")
+
+        assert current_revision(engine) == "0005"
+        with engine.connect() as connection:
+            _assert_baseline_data_intact(connection)
+            endpoint = connection.scalar(
+                text("select endpoint_id from webhook_deliveries where id = :id"),
+                {"id": SEEDED_DELIVERY},
+            )
+        assert endpoint == SEEDED_ENDPOINT
+
+
+def test_the_delivery_endpoint_is_not_nullable(postgres_url: str) -> None:
+    with _database_at_baseline(postgres_url) as (config, engine):
+        command.upgrade(config, "0005")
+
+        with engine.connect() as connection:
+            nullable = connection.scalar(
+                text(
+                    "select is_nullable from information_schema.columns "
+                    "where table_name = 'webhook_deliveries' and column_name = 'endpoint_id'"
+                )
+            )
+
+    assert nullable == "NO"
+
+
+@pytest.mark.parametrize("table", ["webhook_deliveries", "delivery_attempts"])
+def test_the_submission_link_becomes_nullable(postgres_url: str, table: str) -> None:
+    """
+    a submission cannot be deleted without somewhere for its history to point instead
+    :param postgres_url: a URL on the PostgreSQL server to work against
+    :param table: the table whose link to the submission is being checked
+    """
+    with _database_at_baseline(postgres_url) as (config, engine):
+        command.upgrade(config, "0005")
+
+        with engine.connect() as connection:
+            nullable = connection.scalar(
+                text(
+                    "select is_nullable from information_schema.columns "
+                    "where table_name = :table and column_name = 'submission_id'"
+                ),
+                {"table": table},
+            )
+
+    assert nullable == "YES"
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    [
+        "fk_webhook_deliveries_submission_id_submissions",
+        "fk_delivery_attempts_submission_id_submissions",
+    ],
+)
+def test_deleting_a_submission_unlinks_history_rather_than_cascading(
+    postgres_url: str, constraint: str
+) -> None:
+    """
+    a cascade here would take the operational history with the form content
+    :param postgres_url: a URL on the PostgreSQL server to work against
+    :param constraint: the foreign key whose delete rule is being checked
+    """
+    with _database_at_baseline(postgres_url) as (config, engine):
+        command.upgrade(config, "0005")
+
+        with engine.connect() as connection:
+            rule = connection.scalar(
+                text(
+                    "select confdeltype from pg_constraint where conname = :name",
+                ),
+                {"name": constraint},
+            )
+
+    # ``n`` is SET NULL. ``c`` would be CASCADE, which is the mistake this asserts
+    # against, and ``a`` would be NO ACTION, which is what 0004 had.
+    assert rule == "n"
+
+
+def test_the_submission_indexes_match_what_management_reads(postgres_url: str) -> None:
+    with _database_at_baseline(postgres_url) as (config, engine):
+        command.upgrade(config, "0005")
+
+        with engine.connect() as connection:
+            indexed = set(
+                connection.scalars(
+                    text("select indexname from pg_indexes where tablename = 'submissions'")
+                )
+            )
+
+    assert "ix_submissions_received_at_id" in indexed
+    assert "ix_submissions_endpoint_id_received_at_id" in indexed
+    # Replaced rather than joined by the composite, whose leftmost column answers
+    # the same lookup.
+    assert "ix_submissions_endpoint_id" not in indexed
+
+
+def test_downgrading_from_0005_removes_what_it_added(postgres_url: str) -> None:
+    with _database_at_baseline(postgres_url) as (config, engine):
+        with engine.begin() as connection:
+            _seed_baseline_data(connection)
+        command.upgrade(config, "0005")
+
+        command.downgrade(config, "0004")
+
+        assert current_revision(engine) == "0004"
+        columns = {column["name"] for column in inspect(engine).get_columns("webhook_deliveries")}
+        assert "endpoint_id" not in columns
+        with engine.connect() as connection:
+            _assert_baseline_data_intact(connection)
+
+
+def test_downgrading_removes_only_the_deliveries_that_lost_their_submission(
+    postgres_url: str,
+) -> None:
+    """
+    the older schema cannot hold an unlinked delivery, and everything else must survive
+    :param postgres_url: a URL on the PostgreSQL server to work against
+    """
+    with _database_at_baseline(postgres_url) as (config, engine):
+        with engine.begin() as connection:
+            _seed_baseline_data(connection)
+        command.upgrade(config, "0005")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "insert into submissions (id, endpoint_id, received_at, fields) values "
+                    "(:id, :endpoint, :now, :fields)"
+                ),
+                {
+                    "id": "sub_44444444444444444444444444444444",
+                    "endpoint": SEEDED_ENDPOINT,
+                    "now": SEEDED_AT,
+                    "fields": '{"email": ["gone@example.com"]}',
+                },
+            )
+            connection.execute(
+                text(
+                    "insert into webhook_deliveries (id, submission_id, endpoint_id, "
+                    "destination_url, signing_secret, state, attempts, cycle_attempts, "
+                    "next_attempt_at, created_at, completed_at) values "
+                    "(:id, :submission, :endpoint, 'https://example.invalid/hook', :secret, "
+                    "'delivered', 1, 1, :now, :now, :now)"
+                ),
+                {
+                    "id": "whd_55555555555555555555555555555555",
+                    "submission": "sub_44444444444444444444444444444444",
+                    "endpoint": SEEDED_ENDPOINT,
+                    "now": SEEDED_AT,
+                    "secret": "whsec_" + "a" * 64,
+                },
+            )
+            # Retention taking a delivered submission, which is the only way a
+            # delivery ever ends up without one.
+            connection.execute(
+                text("delete from submissions where id = :id"),
+                {"id": "sub_44444444444444444444444444444444"},
+            )
+
+        command.downgrade(config, "0004")
+
+        with engine.connect() as connection:
+            _assert_baseline_data_intact(connection)
+            remaining = set(connection.scalars(text("select id from webhook_deliveries")))
+        assert remaining == {SEEDED_DELIVERY}
+
+
+def test_a_populated_0004_survives_the_whole_round_trip(postgres_url: str) -> None:
+    """
+    populated 0004 to 0005 and back and forward again must end with zero drift
+    :param postgres_url: a URL on the PostgreSQL server to work against
+    """
+    with _database_at_baseline(postgres_url) as (config, engine):
+        with engine.begin() as connection:
+            _seed_baseline_data(connection)
+        command.upgrade(config, "0004")
+
+        command.upgrade(config, "0005")
+        command.downgrade(config, "0004")
+        command.upgrade(config, "head")
+
+        assert current_revision(engine) == head_revision()
+        with engine.connect() as connection:
+            _assert_baseline_data_intact(connection)
+            assert (
+                connection.scalar(
+                    text("select endpoint_id from webhook_deliveries where id = :id"),
+                    {"id": SEEDED_DELIVERY},
+                )
+                == SEEDED_ENDPOINT
             )
             difference = compare_metadata(MigrationContext.configure(connection), Base.metadata)
         assert difference == [], f"migrated schema differs from the models: {difference}"

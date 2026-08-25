@@ -55,6 +55,20 @@ your webhook with an HMAC signature and a bounded retry schedule.
 
     [Idempotency](guides/idempotency.md)
 
+-   __Submissions you can read back__
+
+    Browse and filter what your forms collected, read one submission in full, and
+    export a range as JSON or CSV. Authenticated, always.
+
+    [Browsing submissions](guides/submission-management.md)
+
+-   __Retention you control__
+
+    Nothing is deleted until you run the cleanup command, and it never removes a
+    submission a delivery could still need.
+
+    [Retention](operations/retention.md)
+
 </div>
 
 ## Requirements
@@ -117,8 +131,8 @@ response in about five minutes.
 
 -   __Guides__
 
-    How ingestion, idempotency, webhooks, rate limiting, endpoint management and
-    delivery replay actually behave.
+    How ingestion, idempotency, webhooks, rate limiting, endpoint management,
+    delivery replay and submission export actually behave.
 
     [Read the guides](guides/form-ingestion.md)
 
@@ -130,8 +144,8 @@ response in about five minutes.
 
 -   __Operations__
 
-    Running the worker, applying migrations, sitting behind a reverse proxy, and
-    every configuration variable.
+    Running the worker, applying migrations, sweeping expired submissions,
+    sitting behind a reverse proxy, and every configuration variable.
 
     [Operate it](operations/worker.md)
 
@@ -141,6 +155,13 @@ response in about five minutes.
     boundaries.
 
     [Understand it](architecture/overview.md)
+
+-   __Data handling__
+
+    Where a submitted value goes, where it never goes, and what deleting one
+    does and does not remove.
+
+    [Handle it carefully](reference/data-handling.md)
 
 -   __Limitations__
 
@@ -156,12 +177,14 @@ response in about five minutes.
 **Early development.** The service registers endpoints, stores submissions with
 the durable obligation to deliver them, and runs a worker that performs the
 signed delivery and retries it. Endpoint management, delivery inspection, manual
-replay and public ingestion rate limiting are all implemented and covered by
-tests, including a PostgreSQL suite that exercises real concurrency.
+replay, public ingestion rate limiting, submission retrieval and export, and
+operator-run retention cleanup are all implemented and covered by tests,
+including a PostgreSQL suite that exercises real concurrency.
 
 There is no spam protection, no CAPTCHA and no content classification. Rate
-limiting bounds volume, not junk. See [Limitations](reference/limitations.md) for
-the full picture.
+limiting bounds volume, not junk. Retention is never automatic: nothing is
+deleted until an operator runs the cleanup command. See
+[Limitations](reference/limitations.md) for the full picture.
 
 ## License
 
