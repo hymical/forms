@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from hymical_forms import __version__
-from hymical_forms.api import endpoints, health, submissions
+from hymical_forms.api import deliveries, endpoints, health, submissions
 from hymical_forms.config import Settings
 from hymical_forms.db import create_engine_from_url, create_session_factory
 from hymical_forms.errors import register_exception_handlers
@@ -77,6 +77,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(endpoints.router)
+    app.include_router(deliveries.router)
     app.include_router(submissions.router)
 
     return app

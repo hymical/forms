@@ -236,6 +236,98 @@ def test_a_populated_database_upgraded_again_still_matches_the_models(postgres_u
         assert difference == [], f"migrated schema differs from the models: {difference}"
 
 
+# --- the retry cycle counter 0003 added --------------------------------------
+#
+# 0003 is the first revision that changes an existing table rather than adding a
+# new one, so an upgrade has to preserve rows it is also rewriting.
+
+
+def test_upgrading_a_populated_0002_adds_the_cycle_counter(postgres_url: str) -> None:
+    """
+    a delivery that has never been replayed must come out with its whole history as its cycle
+    :param postgres_url: a URL on the PostgreSQL server to work against
+    """
+    with _database_at_baseline(postgres_url) as (config, engine):
+        with engine.begin() as connection:
+            _seed_baseline_data(connection)
+        command.upgrade(config, "0002")
+
+        command.upgrade(config, "0003")
+
+        assert current_revision(engine) == "0003"
+        with engine.connect() as connection:
+            _assert_baseline_data_intact(connection)
+            row = connection.execute(
+                text("select attempts, cycle_attempts from webhook_deliveries where id = :id"),
+                {"id": SEEDED_DELIVERY},
+            ).one()
+        assert row.attempts == 1
+        assert row.cycle_attempts == 1
+
+
+def test_the_cycle_counter_is_not_nullable(postgres_url: str) -> None:
+    with _database_at_baseline(postgres_url) as (config, engine):
+        command.upgrade(config, "0003")
+
+        with engine.connect() as connection:
+            nullable = connection.scalar(
+                text(
+                    "select is_nullable from information_schema.columns "
+                    "where table_name = 'webhook_deliveries' and column_name = 'cycle_attempts'"
+                )
+            )
+
+    assert nullable == "NO"
+
+
+def test_downgrading_from_0003_leaves_the_delivery_data_alone(postgres_url: str) -> None:
+    """
+    the downgrade must remove the column 0003 added and nothing else
+    :param postgres_url: a URL on the PostgreSQL server to work against
+    """
+    with _database_at_baseline(postgres_url) as (config, engine):
+        with engine.begin() as connection:
+            _seed_baseline_data(connection)
+        command.upgrade(config, "0003")
+
+        command.downgrade(config, "0002")
+
+        assert current_revision(engine) == "0002"
+        columns = {column["name"] for column in inspect(engine).get_columns("webhook_deliveries")}
+        assert "cycle_attempts" not in columns
+        assert "attempts" in columns
+        with engine.connect() as connection:
+            _assert_baseline_data_intact(connection)
+
+
+def test_a_populated_0002_survives_the_whole_round_trip(postgres_url: str) -> None:
+    """
+    populated 0002 to 0003 and back and forward again must end with zero drift
+    :param postgres_url: a URL on the PostgreSQL server to work against
+    """
+    with _database_at_baseline(postgres_url) as (config, engine):
+        with engine.begin() as connection:
+            _seed_baseline_data(connection)
+        command.upgrade(config, "0002")
+
+        command.upgrade(config, "0003")
+        command.downgrade(config, "0002")
+        command.upgrade(config, "0003")
+
+        assert current_revision(engine) == head_revision()
+        with engine.connect() as connection:
+            _assert_baseline_data_intact(connection)
+            assert (
+                connection.scalar(
+                    text("select cycle_attempts from webhook_deliveries where id = :id"),
+                    {"id": SEEDED_DELIVERY},
+                )
+                == 1
+            )
+            difference = compare_metadata(MigrationContext.configure(connection), Base.metadata)
+        assert difference == [], f"migrated schema differs from the models: {difference}"
+
+
 @contextmanager
 def _database_at_baseline(postgres_url: str) -> Iterator[tuple[Config, Engine]]:
     """

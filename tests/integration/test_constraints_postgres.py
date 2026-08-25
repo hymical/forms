@@ -58,6 +58,7 @@ def a_delivery(delivery_id: str, submission_id: str) -> models.WebhookDelivery:
         signing_secret="whsec_" + "a" * 64,
         state=DeliveryState.PENDING,
         attempts=0,
+        cycle_attempts=0,
         next_attempt_at=NOW,
         created_at=NOW,
     )

@@ -113,6 +113,67 @@ def seed_endpoint(session: Session, endpoint_id: str = "contact-form") -> models
     return endpoint
 
 
+def seed_failed_delivery(
+    session: Session,
+    *,
+    now: datetime,
+    endpoint_id: str = "contact-form",
+    attempts: int = 5,
+) -> str:
+    """
+    insert a submission whose delivery has already been given up on
+    :param session: the session to insert through
+    :param now: the instant the delivery was queued and completed
+    :param endpoint_id: the endpoint it belongs to
+    :param attempts: how many requests were made before it was given up on
+    :returns: the delivery id
+    """
+    submission_id = f"sub_{uuid.uuid4().hex}"
+    delivery_id = f"whd_{uuid.uuid4().hex}"
+    session.add(
+        models.Submission(
+            id=submission_id,
+            endpoint_id=endpoint_id,
+            received_at=now,
+            fields={"email": ["dev@example.com"]},
+        )
+    )
+    session.add(
+        models.WebhookDelivery(
+            id=delivery_id,
+            submission_id=submission_id,
+            destination_url="https://example.invalid/hook",
+            signing_secret="whsec_" + "a" * 64,
+            state=DeliveryState.FAILED,
+            attempts=attempts,
+            cycle_attempts=attempts,
+            next_attempt_at=now,
+            created_at=now,
+            completed_at=now,
+        )
+    )
+    # Flushed before the attempts, because nothing in this schema declares an ORM
+    # relationship, so the unit of work has no reason to insert the rows the
+    # attempts reference first.
+    session.flush()
+
+    for number in range(1, attempts + 1):
+        session.add(
+            models.DeliveryAttempt(
+                id=f"att_{uuid.uuid4().hex}",
+                delivery_id=delivery_id,
+                submission_id=submission_id,
+                attempt_number=number,
+                destination_url="https://example.invalid/hook",
+                attempted_at=now,
+                outcome="http_error",
+                response_status=503,
+            )
+        )
+    session.commit()
+    return delivery_id
+
+
 def seed_due_deliveries(
     session: Session, count: int, *, now: datetime, endpoint_id: str = "contact-form"
 ) -> list[str]:
