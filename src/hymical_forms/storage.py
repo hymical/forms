@@ -10,9 +10,11 @@ idempotency race; :func:`claim_due_deliveries`, because a claim is only worth
 anything once it is committed; :func:`complete_attempt`, because the audit
 record and the state it justifies have to land together; :func:`update_endpoint`
 and :func:`requeue_failed_delivery`, because each is the whole of what its
-management request came to do; and the two management key writes,
+management request came to do; the two management key writes,
 :func:`revoke_management_key` and :func:`record_management_key_use`, for the
-same reason.
+same reason; and the two rate limit operations, :func:`consume_rate_limit` and
+:func:`delete_expired_rate_limit_counters`, because abuse accounting has to
+outlive the request it was accounting for.
 """
 
 from __future__ import annotations
@@ -21,13 +23,16 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, TypeVar, cast
 
-from sqlalchemy import ColumnElement, Select, and_, or_, select, tuple_, update
+from sqlalchemy import ColumnElement, Select, and_, delete, or_, select, tuple_, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from hymical_forms import models
 from hymical_forms.ingestion import Submission
+from hymical_forms.ratelimit import Limiter
 from hymical_forms.webhooks import (
     DeliveryOutcome,
     DeliveryResult,
@@ -732,6 +737,123 @@ def record_management_key_use(session: Session, key_id: str, *, now: datetime) -
         .values(last_used_at=now)
     )
     session.commit()
+
+
+class UnsupportedRateLimitBackend(Exception):
+    """
+    raised when the configured database cannot perform an atomic counter upsert
+    """
+
+    def __init__(self, dialect: str) -> None:
+        """
+        record which backend was asked to enforce a rate limit
+        :param dialect: the SQLAlchemy dialect name the session is bound to
+        """
+        super().__init__(
+            f"rate limiting needs PostgreSQL or SQLite, not {dialect!r}, "
+            "because the counter is incremented with an upsert"
+        )
+        self.dialect = dialect
+
+
+def consume_rate_limit(
+    session: Session,
+    *,
+    limiter: Limiter,
+    subject: str,
+    window_start: datetime,
+) -> int:
+    """
+    spend one unit of a subject's budget for one window, atomically
+    :param session: the session to write through
+    :param limiter: which budget is being drawn from
+    :param subject: the value that budget is keyed by
+    :param window_start: the start of the fixed window being counted in
+    :returns: how many attempts this subject has now made inside that window
+    :raises UnsupportedRateLimitBackend: if the session is bound to another database
+    """
+    # One statement decides everything. Reading the counter, comparing it in
+    # Python and writing it back would let two requests that arrive together both
+    # read the same value, both find room, and both pass, which is precisely the
+    # hole a rate limiter exists to close. Here the database inserts the row or
+    # increments the existing one under its own row lock, and hands back the value
+    # it settled on, so two simultaneous requests get two different numbers and at
+    # most one of them can be the last one under the limit.
+    #
+    # ``ON CONFLICT DO UPDATE`` rather than a lock-then-update, because the row
+    # for a brand new subject does not exist yet and two requests racing to create
+    # it have nothing to lock. The upsert makes the create and the increment the
+    # same operation, so the first request of a window is settled by the primary
+    # key rather than by whoever inserted first.
+    counter = models.RateLimitCounter
+    upsert: Any = _upsert_for(session)
+    statement = (
+        upsert(counter)
+        .values(
+            limiter=str(limiter),
+            subject=subject,
+            window_start=window_start,
+            attempts=1,
+        )
+        .on_conflict_do_update(
+            index_elements=["limiter", "subject", "window_start"],
+            # The unqualified column on the right is the stored row's value, not
+            # the one this statement proposed, which is what makes this an
+            # increment rather than an overwrite.
+            set_={"attempts": counter.attempts + 1},
+        )
+        .returning(counter.attempts)
+    )
+    used = cast(int, session.scalars(statement).one())
+
+    # Committed here, and deliberately not left to the caller. The decision has to
+    # survive whatever the request does next: a submission that is refused, fails
+    # validation, or loses an idempotency race rolls its own work back, and abuse
+    # accounting that rolled back with it would let an attacker send unlimited
+    # traffic as long as every request was invalid.
+    session.commit()
+    return used
+
+
+def delete_expired_rate_limit_counters(session: Session, *, before: datetime) -> int:
+    """
+    remove counters for windows old enough that nothing will consult them again
+    :param session: the session to write through
+    :param before: counters whose window starts strictly before this instant are removed
+    :returns: how many counters were removed
+    """
+    # A range over the indexed window column, so this is a bounded delete rather
+    # than a scan of the table. The caller chooses a cutoff several windows in the
+    # past, so a sweep can never take a window that is still being counted in.
+    counter = models.RateLimitCounter
+    result = cast(
+        "CursorResult[Any]",
+        session.execute(
+            delete(counter)
+            .where(counter.window_start < before)
+            .execution_options(synchronize_session=False)
+        ),
+    )
+    session.commit()
+    return result.rowcount
+
+
+def _upsert_for(session: Session) -> Any:
+    """
+    pick the dialect-specific insert that can express an atomic increment
+    :param session: the session whose backend the statement will run against
+    :returns: the dialect's ``insert`` construct
+    :raises UnsupportedRateLimitBackend: if the backend is neither PostgreSQL nor SQLite
+    """
+    # ``ON CONFLICT`` is not in the generic construct, so the dialect has to be
+    # named. Anything else is refused rather than silently falling back to a
+    # read-compare-write that would not be atomic.
+    dialect = session.get_bind().dialect.name
+    if dialect == "postgresql":
+        return postgresql_insert
+    if dialect == "sqlite":
+        return sqlite_insert
+    raise UnsupportedRateLimitBackend(dialect)
 
 
 def _page_after(session: Session, model: type[_Paged], cursor: str) -> ColumnElement[bool]:

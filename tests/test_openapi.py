@@ -100,6 +100,17 @@ def test_a_management_route_documents_its_refusal(
     assert "401" in responses
 
 
+def test_the_submission_route_documents_being_rate_limited(client: TestClient) -> None:
+    """
+    a public route that can answer 429 has to say so, or a caller cannot handle it
+    :param client: test client whose app holds the default endpoint
+    """
+    responses = operation(client, "/f/{endpoint_id}", "post")["responses"]
+
+    assert "429" in responses
+    assert "401" not in responses, "the public submission route advertises authentication"
+
+
 def test_no_response_schema_mentions_a_webhook_signing_secret(client: TestClient) -> None:
     """
     a read model that could name the secret is a leak waiting to be written

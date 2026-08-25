@@ -24,7 +24,7 @@ from hymical_forms.schema import alembic_config, current_revision, head_revision
 from integration.support import temporary_database
 
 BASELINE_TABLES = {"endpoints", "submissions", "webhook_deliveries", "delivery_attempts"}
-EXPECTED_TABLES = BASELINE_TABLES | {"management_api_keys"}
+EXPECTED_TABLES = BASELINE_TABLES | {"management_api_keys", "rate_limit_counters"}
 
 # Representative interval 6 data: an endpoint with a webhook, a submission sent
 # with an idempotency key, the delivery it owes, and one recorded attempt.
@@ -92,6 +92,7 @@ def test_the_migration_creates_the_constraints_the_application_relies_on(
         "uq_submissions_endpoint_idempotency_key",
         "uq_webhook_deliveries_submission",
         "uq_management_api_keys_key_digest",
+        "pk_rate_limit_counters",
         "ck_endpoints_webhook_configuration",
         "ck_submissions_idempotency_identity",
         "ck_webhook_deliveries_completion",
@@ -302,7 +303,7 @@ def test_downgrading_from_0003_leaves_the_delivery_data_alone(postgres_url: str)
 
 def test_a_populated_0002_survives_the_whole_round_trip(postgres_url: str) -> None:
     """
-    populated 0002 to 0003 and back and forward again must end with zero drift
+    populated 0002 to 0003 and back and forward to head must end with zero drift
     :param postgres_url: a URL on the PostgreSQL server to work against
     """
     with _database_at_baseline(postgres_url) as (config, engine):
@@ -312,7 +313,134 @@ def test_a_populated_0002_survives_the_whole_round_trip(postgres_url: str) -> No
 
         command.upgrade(config, "0003")
         command.downgrade(config, "0002")
+        command.upgrade(config, "head")
+
+        assert current_revision(engine) == head_revision()
+        with engine.connect() as connection:
+            _assert_baseline_data_intact(connection)
+            assert (
+                connection.scalar(
+                    text("select cycle_attempts from webhook_deliveries where id = :id"),
+                    {"id": SEEDED_DELIVERY},
+                )
+                == 1
+            )
+            difference = compare_metadata(MigrationContext.configure(connection), Base.metadata)
+        assert difference == [], f"migrated schema differs from the models: {difference}"
+
+
+# --- the rate limit counters 0004 added --------------------------------------
+#
+# 0004 adds a table rather than changing one, so what an upgrade has to prove
+# here is that everything an operator's database already held is untouched, and
+# that the new table arrives empty and ready rather than needing a backfill.
+
+
+def test_upgrading_a_populated_0003_adds_the_counter_table(postgres_url: str) -> None:
+    """
+    the rate limit table must arrive without disturbing anything already stored
+    :param postgres_url: a URL on the PostgreSQL server to work against
+    """
+    with _database_at_baseline(postgres_url) as (config, engine):
+        with engine.begin() as connection:
+            _seed_baseline_data(connection)
         command.upgrade(config, "0003")
+        assert "rate_limit_counters" not in set(inspect(engine).get_table_names())
+
+        command.upgrade(config, "0004")
+
+        assert current_revision(engine) == "0004"
+        assert "rate_limit_counters" in set(inspect(engine).get_table_names())
+        with engine.connect() as connection:
+            _assert_baseline_data_intact(connection)
+            assert connection.scalar(text("select count(*) from rate_limit_counters")) == 0
+
+
+def test_the_counter_table_is_keyed_by_limiter_subject_and_window(postgres_url: str) -> None:
+    """
+    the upsert conflicts on this key, so the key is what makes the increment atomic
+    :param postgres_url: a URL on the PostgreSQL server to work against
+    """
+    with _database_at_baseline(postgres_url) as (config, engine):
+        command.upgrade(config, "0004")
+
+        with engine.connect() as connection:
+            key = list(
+                connection.scalars(
+                    text(
+                        "select a.attname from pg_index i "
+                        "join pg_attribute a on a.attrelid = i.indrelid "
+                        "and a.attnum = any(i.indkey) "
+                        "where i.indrelid = 'rate_limit_counters'::regclass and i.indisprimary"
+                    )
+                )
+            )
+            indexed = set(
+                connection.scalars(
+                    text("select indexname from pg_indexes where tablename = 'rate_limit_counters'")
+                )
+            )
+
+    assert set(key) == {"limiter", "subject", "window_start"}
+    # Cleanup ranges over the window column without knowing a limiter or a
+    # subject, which the primary key cannot answer.
+    assert "ix_rate_limit_counters_window_start" in indexed
+
+
+def test_the_counter_window_is_stored_with_a_timezone(postgres_url: str) -> None:
+    with _database_at_baseline(postgres_url) as (config, engine):
+        command.upgrade(config, "0004")
+
+        with engine.connect() as connection:
+            data_type = connection.scalar(
+                text(
+                    "select data_type from information_schema.columns "
+                    "where table_name = 'rate_limit_counters' and column_name = 'window_start'"
+                )
+            )
+
+    assert data_type == "timestamp with time zone"
+
+
+def test_downgrading_from_0004_leaves_everything_else_alone(postgres_url: str) -> None:
+    """
+    the downgrade must remove the table 0004 added and nothing else
+    :param postgres_url: a URL on the PostgreSQL server to work against
+    """
+    with _database_at_baseline(postgres_url) as (config, engine):
+        with engine.begin() as connection:
+            _seed_baseline_data(connection)
+        command.upgrade(config, "0004")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "insert into rate_limit_counters (limiter, subject, window_start, attempts) "
+                    "values ('ip', :subject, :now, 3)"
+                ),
+                {"subject": "e" * 64, "now": SEEDED_AT},
+            )
+
+        command.downgrade(config, "0003")
+
+        assert current_revision(engine) == "0003"
+        assert "rate_limit_counters" not in set(inspect(engine).get_table_names())
+        with engine.connect() as connection:
+            _assert_baseline_data_intact(connection)
+
+
+def test_a_populated_0003_survives_the_whole_round_trip(postgres_url: str) -> None:
+    """
+    populated 0003 to 0004 and back and forward again must end with zero drift
+    :param postgres_url: a URL on the PostgreSQL server to work against
+    """
+    with _database_at_baseline(postgres_url) as (config, engine):
+        with engine.begin() as connection:
+            _seed_baseline_data(connection)
+        command.upgrade(config, "0003")
+
+        command.upgrade(config, "0004")
+        command.downgrade(config, "0003")
+        command.upgrade(config, "0004")
 
         assert current_revision(engine) == head_revision()
         with engine.connect() as connection:
