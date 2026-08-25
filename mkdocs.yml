@@ -121,3 +121,5 @@ nav:
   - Reference:
       - Data Handling: reference/data-handling.md
       - Limitations: reference/limitations.md
+      - Release Notes:
+          - v0.2.0: releases/v0.2.0.md

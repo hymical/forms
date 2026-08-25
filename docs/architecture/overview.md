@@ -4,12 +4,11 @@ Two processes, one database, no broker.
 
 ```mermaid
 flowchart TD
-    Form["HTML form"] -->|"POST /f/{endpoint_id}"| API["FastAPI API process"]
-    Operator["Operator"] -->|"Authenticated management routes"| API
-    API --> DB[("PostgreSQL")]
-    DB --- Rows["submission + delivery job, one transaction"]
-    DB --> Worker["Delivery worker process"]
-    Worker -->|"Signed HTTP POST"| Receiver["Your webhook receiver"]
+    Form["Browser / HTML form"] -->|"POST /f/{endpoint_id}, public"| API["FastAPI API"]
+    Operator["Operator"] -->|"authenticated management API"| API
+    API -->|"submission + delivery job, one transaction"| DB[("PostgreSQL")]
+    DB --> Worker["Delivery worker"]
+    Worker -->|"HMAC signed webhook"| Receiver["Developer endpoint"]
     Worker --> DB
 ```
 

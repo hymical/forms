@@ -47,7 +47,11 @@ mkdocs serve
     export FORMS_DATABASE_URL=sqlite:///./forms.db
     ```
 
-    Fine for trying the service out. Not a production target.
+    Backs the test suite and is not a production target. It is also not usable
+    for this walkthrough: a fresh SQLite database cannot reach the current
+    migration, `0005`, through `alembic upgrade head`. See
+    [Database migrations](../operations/migrations.md#sqlite). Use PostgreSQL to
+    actually run the service.
 
 The PostgreSQL driver (`psycopg`) is a runtime dependency, so nothing extra needs
 installing for either backend.

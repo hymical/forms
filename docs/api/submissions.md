@@ -80,7 +80,7 @@ Every request that reaches it spends budget, whether or not it is accepted. See
 Reports that the API process is running.
 
 ```json
-{ "status": "ok", "service": "hymical-forms", "version": "0.1.0" }
+{ "status": "ok", "service": "hymical-forms", "version": "0.2.0" }
 ```
 
 **Public**, and not rate limited.

@@ -136,6 +136,49 @@ The worker will have claimed it, attempted it, and either marked it `delivered`
 or scheduled a retry. `GET /deliveries/{delivery_id}` shows the full attempt
 history.
 
+## 8. See a failed delivery, and replay it (optional)
+
+Point an endpoint at a destination nothing is listening on, and give it a single
+attempt, so it reaches `failed` right away instead of retrying for an hour first.
+Stop the API and worker, export two more variables, and start them again:
+
+```bash
+export FORMS_ALLOW_PRIVATE_WEBHOOK_TARGETS=true   # local demo only, never in production
+export FORMS_WEBHOOK_MAX_ATTEMPTS=1
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/endpoints \
+  -H "Authorization: Bearer $HYMICAL_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"id": "broken-demo", "name": "Broken demo",
+       "webhook_url": "http://127.0.0.1:9/nothing-here"}'
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/f/broken-demo -d hello=world
+```
+
+Give the worker a moment to claim and attempt it, then look for it:
+
+```bash
+curl "http://127.0.0.1:8000/deliveries?endpoint_id=broken-demo&state=failed" \
+  -H "Authorization: Bearer $HYMICAL_KEY"
+```
+
+Take the `id` from the response and replay it:
+
+```bash
+curl -X POST http://127.0.0.1:8000/deliveries/whd_REPLACE_WITH_THE_ID/replay \
+  -H "Authorization: Bearer $HYMICAL_KEY"
+```
+
+It goes back to `pending`, and the worker attempts it again on its next poll. Against
+this same broken destination it fails again, which is expected: the point of the
+exercise is the state transition, `failed` to `pending` to `failed`, not a
+successful send. Point `webhook_url` somewhere real to see a replay succeed. Full
+detail: [Delivery replay](../guides/delivery-replay.md).
+
 ## Where to go next
 
 | You want to | Read |
