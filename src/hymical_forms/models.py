@@ -13,6 +13,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     MetaData,
     String,
     TypeDecorator,
@@ -177,13 +178,22 @@ class Submission(Base):
             "(idempotency_key IS NULL) = (payload_fingerprint IS NULL)",
             name="idempotency_identity",
         ),
+        # The order every submission management read walks in, newest first, and
+        # the range the retention sweep deletes over. Both columns are in it
+        # because the page boundary is a row-value comparison over the timestamp
+        # and the identifier together, so an index stopping at the timestamp
+        # would still leave the ties to be sorted.
+        Index("ix_submissions_received_at_id", "received_at", "id"),
+        # The same walk narrowed to one endpoint. Its leftmost column answers a
+        # lookup by endpoint on its own just as well, so this replaces the plain
+        # endpoint index rather than standing beside it.
+        Index("ix_submissions_endpoint_id_received_at_id", "endpoint_id", "received_at", "id"),
     )
 
     id: Mapped[str] = mapped_column(String(SUBMISSION_ID_MAX_LENGTH), primary_key=True)
     endpoint_id: Mapped[str] = mapped_column(
         String(ENDPOINT_ID_MAX_LENGTH),
         ForeignKey("endpoints.id"),
-        index=True,
     )
     received_at: Mapped[datetime] = mapped_column(UtcDateTime)
 
@@ -264,11 +274,29 @@ class WebhookDelivery(Base):
             "(state IN ('delivered', 'failed')) = (completed_at IS NOT NULL)",
             name="completion",
         ),
+        # The order and the filter the delivery listing reads in. It used to
+        # reach the endpoint through the submission, so this index is what
+        # replaces the join now that the column is here.
+        Index("ix_webhook_deliveries_endpoint_id_created_at_id", "endpoint_id", "created_at", "id"),
     )
 
     id: Mapped[str] = mapped_column(String(WEBHOOK_DELIVERY_ID_MAX_LENGTH), primary_key=True)
-    submission_id: Mapped[str] = mapped_column(
-        String(SUBMISSION_ID_MAX_LENGTH), ForeignKey("submissions.id")
+
+    # Null once retention has removed the submission this delivery carried, which
+    # it only ever does for a delivery that has already been delivered. Every
+    # state a delivery can still be attempted from protects its submission, so a
+    # delivery a worker can claim always still has the payload it needs.
+    submission_id: Mapped[str | None] = mapped_column(
+        String(SUBMISSION_ID_MAX_LENGTH),
+        ForeignKey("submissions.id", ondelete="SET NULL"),
+    )
+
+    # Recorded on the delivery rather than reached through the submission, so an
+    # operational record still says which endpoint it belongs to after the
+    # submission it carried has been retained away. It is snapshotted for the
+    # same reason the destination is: it describes what this delivery was for.
+    endpoint_id: Mapped[str] = mapped_column(
+        String(ENDPOINT_ID_MAX_LENGTH), ForeignKey("endpoints.id")
     )
 
     # The destination and secret are snapshotted, not read through to the
@@ -323,9 +351,13 @@ class DeliveryAttempt(Base):
         ForeignKey("webhook_deliveries.id"),
         index=True,
     )
-    submission_id: Mapped[str] = mapped_column(
+    # Null once retention has removed the submission, for the same reason and
+    # under the same rule as on the delivery. The attempt itself is never
+    # removed: what a delivery did is operational history, and it stays readable
+    # through its delivery whether or not the submitted content still exists.
+    submission_id: Mapped[str | None] = mapped_column(
         String(SUBMISSION_ID_MAX_LENGTH),
-        ForeignKey("submissions.id"),
+        ForeignKey("submissions.id", ondelete="SET NULL"),
         index=True,
     )
     attempt_number: Mapped[int] = mapped_column()

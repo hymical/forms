@@ -28,12 +28,14 @@ from fastapi.testclient import TestClient
 from pydantic_settings import SettingsConfigDict
 from sqlalchemy.orm import Session, sessionmaker
 
-from hymical_forms import apikeys, storage
+from hymical_forms import apikeys, models, storage
 from hymical_forms.app import create_app
 from hymical_forms.config import Settings
 from hymical_forms.delivery import create_webhook_client
+from hymical_forms.ingestion import new_submission_id
 from hymical_forms.models import utcnow
 from hymical_forms.schema import create_all
+from hymical_forms.webhooks import DeliveryState, new_webhook_delivery_id
 from hymical_forms.worker import process_batch
 from webhook_server import WebhookRecorder
 
@@ -106,6 +108,66 @@ def create_endpoint(
     response = client.post("/endpoints", json=body, headers=headers)
     assert response.status_code == 201, response.text
     return cast(dict[str, Any], response.json())
+
+
+def seed_submission(
+    client: TestClient,
+    *,
+    received_at: datetime,
+    endpoint_id: str = DEFAULT_ENDPOINT_ID,
+    fields: dict[str, list[str]] | None = None,
+    idempotency_key: str | None = None,
+    delivery_state: DeliveryState | None = None,
+    attempts: int = 0,
+) -> str:
+    """
+    write a submission straight into a client's database, at a chosen moment
+    :param client: the client whose application database should hold it
+    :param received_at: the instant the submission should claim it was accepted
+    :param endpoint_id: the endpoint it belongs to
+    :param fields: the submitted values, defaulting to one email field
+    :param idempotency_key: the key it was sent with, or None if it was sent without one
+    :param delivery_state: the state of the delivery it owes, or None to owe none
+    :param attempts: how many requests have been made for that delivery
+    :returns: the submission identifier
+    """
+    # Ingestion decides ``received_at`` from the clock, so anything about time
+    # ranges or retention has to write the row rather than post to the endpoint.
+    # It goes in through the models the API reads back, not through raw SQL, so a
+    # seeded submission is indistinguishable from a submitted one.
+    submission_id = new_submission_id()
+    terminal = delivery_state in (DeliveryState.DELIVERED, DeliveryState.FAILED)
+    with open_session(client) as session:
+        session.add(
+            models.Submission(
+                id=submission_id,
+                endpoint_id=endpoint_id,
+                received_at=received_at,
+                fields=fields if fields is not None else {"email": ["dev@example.com"]},
+                idempotency_key=idempotency_key,
+                # Paired with the key by a check constraint, and never read back
+                # by anything these tests assert on.
+                payload_fingerprint="f" * 64 if idempotency_key is not None else None,
+            )
+        )
+        if delivery_state is not None:
+            session.add(
+                models.WebhookDelivery(
+                    id=new_webhook_delivery_id(),
+                    submission_id=submission_id,
+                    endpoint_id=endpoint_id,
+                    destination_url="https://example.invalid/hook",
+                    signing_secret="whsec_" + "a" * 64,
+                    state=delivery_state,
+                    attempts=attempts,
+                    cycle_attempts=attempts,
+                    next_attempt_at=received_at,
+                    created_at=received_at,
+                    completed_at=received_at if terminal else None,
+                )
+            )
+        session.commit()
+    return submission_id
 
 
 def bearer(api_key: str) -> dict[str, str]:

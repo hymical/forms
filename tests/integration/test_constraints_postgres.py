@@ -54,6 +54,7 @@ def a_delivery(delivery_id: str, submission_id: str) -> models.WebhookDelivery:
     return models.WebhookDelivery(
         id=delivery_id,
         submission_id=submission_id,
+        endpoint_id="contact-form",
         destination_url="https://example.invalid/hook",
         signing_secret="whsec_" + "a" * 64,
         state=DeliveryState.PENDING,

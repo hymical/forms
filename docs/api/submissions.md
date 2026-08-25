@@ -95,12 +95,17 @@ whether to restart the process. It is not a readiness check.
 
 ## Reading submissions back
 
-There is **no route that returns a stored submission**. Submitted values are not
-exposed by any endpoint, including the delivery views. Retrieval, export and
-retention are not implemented. See [Limitations](../reference/limitations.md).
+**No public route returns a stored submission.** This one answers with an
+acknowledgement, and the delivery views carry no submitted values either.
+
+Reading a submission back is authenticated, on the routes in
+[Submission Management](submission-management.md). See
+[Data handling](../reference/data-handling.md) for everywhere a submitted value
+does and does not go.
 
 ## Related
 
 - [Form ingestion](../guides/form-ingestion.md) for content types, limits and repeated fields
 - [Idempotency](../guides/idempotency.md)
+- [Submission Management](submission-management.md) for reading submissions back
 - [Errors](errors.md) for the full error table

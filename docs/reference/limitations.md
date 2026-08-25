@@ -72,8 +72,11 @@ deploy it, and it is kept complete rather than flattering.
 
 ## Idempotency
 
-- **Idempotency keys never expire.** A key stays spent for as long as its
-  submission is stored, so the table only grows. Expiry belongs with retention.
+- **Idempotency keys expire only with their submission.** A key stays spent for as
+  long as its submission is stored. Configuring
+  [retention](../operations/retention.md) is what eventually releases one, because
+  the uniqueness constraint lives on the row; without retention the table only
+  grows.
 - **Idempotency keys are shared across all clients of an endpoint,** because there
   is nothing to scope them to yet. Guessing another client's key returns that
   submission's ID and timestamp, though never its contents. Random keys of the
@@ -87,9 +90,28 @@ deploy it, and it is kept complete rather than flattering.
 
 ## Data and API surface
 
-- **No way to read submissions back over the API.** They are stored, and a
-  delivery can be inspected, but the submitted values themselves are deliberately
-  not exposed by any route. Retrieval, export and retention are not implemented.
+- **Submissions cannot be searched by content.** The listing filters by endpoint
+  and by received time and nothing else. There is no field-value search, no
+  full-text search, and no filtering by delivery state. Export the range and grep
+  it. See [Browsing submissions](../guides/submission-management.md).
+- **There is no per-submission delete route.** Removing one person's data means
+  finding their submissions through the listing filters and deleting the rows
+  directly in the database. Retention deletes by age, not by who sent something.
+- **A failed delivery pins its submission indefinitely.** Retention will not
+  delete a submission whose delivery could still be replayed, because a replay
+  rebuilds the payload from it. Resolve failed deliveries if you want retention to
+  reach them. See [Retention](../operations/retention.md).
+- **Delivery records are never deleted.** Retention covers submissions only, so
+  the delivery and attempt tables grow without bound. Deleting a submission
+  unlinks its delivery rather than removing it.
+- **Retention is never automatic.** Nothing is deleted until an operator runs
+  `cleanup-submissions`. There is no scheduler and no daemon; use cron.
+- **An export is capped and refused rather than truncated,** at
+  `FORMS_EXPORT_MAX_SUBMISSIONS`. Larger sets have to be taken in ranges. There is
+  no background export job and no download that resumes.
+- **A CSV export is built in one pass before it is sent,** because its header is
+  the union of every field name in the export. The size cap is what bounds that.
+  JSON exports stream.
 - **Endpoints cannot be deleted, and an endpoint ID cannot be changed.** Disabling
   an endpoint is the way to stop it accepting submissions.
 - **No file uploads.** Multipart text fields are accepted; file parts are
@@ -97,6 +119,8 @@ deploy it, and it is kept complete rather than flattering.
 - **`multipart/form-data` bodies are buffered in memory,** bounded by
   `FORMS_MAX_BODY_BYTES`.
 - **Submission IDs are opaque and not yet guaranteed stable in format.**
+- **Nothing is encrypted at rest.** Submitted values are ordinary JSON in
+  PostgreSQL. See [Data handling](data-handling.md).
 
 ## Operations
 
@@ -120,12 +144,13 @@ deploy it, and it is kept complete rather than flattering.
 
 ## Not implemented at all
 
-Dashboards, a frontend, export, retention, submission browsing, endpoint
-deletion, spam filtering, CAPTCHA, email verification, user accounts, tenancy,
-per-endpoint or per-tenant quotas, and billing.
+Dashboards, a frontend, submission search, scheduled retention, delivery
+retention, endpoint deletion, spam filtering, CAPTCHA, email verification, user
+accounts, tenancy, per-endpoint or per-tenant quotas, and billing.
 
 ## Related
 
+- [Data handling](data-handling.md) for what happens to submitted values
 - [Security](../architecture/security.md) for the boundaries that do exist
 - [Delivery semantics](../architecture/delivery-semantics.md)
 - [Rate limiting](../guides/rate-limiting.md)

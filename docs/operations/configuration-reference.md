@@ -78,6 +78,21 @@ value. It must be at least 16 characters.
 The lease must comfortably outlast the connect and read timeouts combined. See
 [Worker](worker.md).
 
+## Submission retrieval and retention
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FORMS_SUBMISSION_RETENTION_DAYS` | `0` | Days a submission is kept before it becomes eligible for deletion |
+| `FORMS_EXPORT_MAX_SUBMISSIONS` | `10000` | Largest number of submissions one export may return |
+
+`0`, the default, keeps submissions indefinitely. A positive value makes older
+submissions eligible for deletion, and deletes nothing on its own: cleanup is a
+command an operator runs. See [Retention](retention.md).
+
+An export matching more than `FORMS_EXPORT_MAX_SUBMISSIONS` is refused rather
+than truncated. See
+[Exporting submissions](../guides/exporting-submissions.md#size-limit).
+
 ## There is no management key setting
 
 Deliberately. Keys live in the database so that creating and revoking one needs

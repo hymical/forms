@@ -133,8 +133,20 @@ class DeliveryView(BaseModel):
     """
 
     id: str = Field(description="Opaque identifier for this logical delivery.")
-    submission_id: str = Field(description="The submission this delivery carries.")
-    endpoint_id: str = Field(description="The endpoint that submission was addressed to.")
+    submission_id: str | None = Field(
+        description=(
+            "The submission this delivery carries, or null once retention has removed "
+            "it. Only a delivery that has already been delivered can lose its "
+            "submission: every state a delivery can still be attempted from keeps the "
+            "payload it would need."
+        )
+    )
+    endpoint_id: str = Field(
+        description=(
+            "The endpoint the submission was addressed to, recorded on the delivery "
+            "when it was queued so that it survives the submission being removed."
+        )
+    )
     state: DeliveryState = Field(description="Where this delivery has got to.")
     destination_url: str = Field(
         description=(
@@ -228,8 +240,8 @@ def list_deliveries(
         raise InvalidCursor() from exc
 
     return DeliveryPage(
-        items=[_view(record) for record in page],
-        next_cursor=next_cursor([record.delivery.id for record in page], limit=limit),
+        items=[_view(delivery) for delivery in page],
+        next_cursor=next_cursor([delivery.id for delivery in page], limit=limit),
     )
 
 
@@ -255,13 +267,13 @@ def get_delivery(
     :returns: the delivery and its attempts, carrying no signing secret
     :raises DeliveryNotFound: if no delivery holds that identifier
     """
-    record = storage.get_delivery(session, delivery_id)
-    if record is None:
+    delivery = storage.get_delivery(session, delivery_id)
+    if delivery is None:
         raise DeliveryNotFound(delivery_id)
 
     attempts = storage.list_delivery_attempts(session, delivery_id)
     return DeliveryDetail(
-        **_view(record).model_dump(),
+        **_view(delivery).model_dump(),
         attempts=[_attempt(attempt) for attempt in attempts],
     )
 
@@ -305,7 +317,7 @@ def replay_delivery(
         # Either the delivery was never failed, or two operators replayed it at
         # once and this is the loser. Both are answered from the state the
         # database settled on, so the answer is the same however the race went.
-        raise DeliveryNotReplayable(delivery_id, outcome.record.delivery.state)
+        raise DeliveryNotReplayable(delivery_id, outcome.record.state)
 
     logger.info(
         "delivery %s requeued by management key %s (%s)",
@@ -316,17 +328,16 @@ def replay_delivery(
     return _view(outcome.record)
 
 
-def _view(record: storage.DeliveryRecord) -> DeliveryView:
+def _view(delivery: models.WebhookDelivery) -> DeliveryView:
     """
     render a delivery for a management read
-    :param record: the delivery and the endpoint it belongs to
+    :param delivery: the persisted delivery
     :returns: the delivery's operational state, carrying no signing secret
     """
-    delivery = record.delivery
     return DeliveryView(
         id=delivery.id,
         submission_id=delivery.submission_id,
-        endpoint_id=record.endpoint_id,
+        endpoint_id=delivery.endpoint_id,
         state=DeliveryState(delivery.state),
         destination_url=delivery.destination_url,
         attempt_count=delivery.attempts,

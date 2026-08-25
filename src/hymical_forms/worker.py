@@ -55,14 +55,14 @@ async def process_batch(
     if not claimed:
         return 0
 
-    submissions = storage.load_submissions(session, [job.submission_id for job in claimed])
+    submissions = storage.load_submissions(session, claimed)
 
     # The network calls overlap so that one unresponsive destination does not
     # hold up the rest of the batch for its whole timeout. They are made with no
     # database transaction open: holding one across somebody else's server would
     # pin a connection for as long as they take to answer.
     bodies = {
-        job.id: webhooks.serialize_payload(webhooks.build_payload(submissions[job.submission_id]))
+        job.id: webhooks.serialize_payload(webhooks.build_payload(submissions[job.id]))
         for job in claimed
     }
     results = await asyncio.gather(

@@ -74,8 +74,10 @@ it is optional rather than required.
 - The credential a request sent is never echoed back.
 - An idempotency conflict says the content differs. It never describes the
   earlier submission, so a key cannot be used to read back somebody else's form.
-- Submitted field values are never returned by any route, including the delivery
-  views.
+- Submitted field values are never returned by a public route, and never by a
+  delivery view. The only routes that return them are the authenticated
+  submission detail and export routes, where returning them is the request. See
+  [Data handling](../reference/data-handling.md).
 
 ## SSRF guardrails
 
