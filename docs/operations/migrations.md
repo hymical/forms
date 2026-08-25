@@ -69,18 +69,33 @@ the DDL before anything touches it.
 
 ## SQLite
 
-Migrations run against SQLite too, so local experimentation works the same way:
+Migrations through `0004` replay against SQLite too, in batch mode, because
+SQLite cannot `ALTER` a column in place and has to rebuild the table instead.
 
-```bash
-export FORMS_DATABASE_URL=sqlite:///./forms.db
-alembic upgrade head
-```
+!!! warning "A fresh SQLite database cannot reach `head`"
 
-Migrations that alter a column are written in batch mode, because SQLite cannot
-`ALTER` in place and has to rebuild the table instead. This is configured already;
-it is not something a migration author has to remember.
+    Revision `0005` alters `webhook_deliveries` and `delivery_attempts` directly
+    rather than through batch mode, because both tables carry foreign keys
+    between them and rebuilding one while SQLite enforces the other's key is not
+    a rebuild batch mode can do safely. That revision's own docstring explains the
+    reasoning: it is written for PostgreSQL, which performs every one of its
+    operations in place, and SQLite is not its migration target.
 
-SQLite remains unsupported as a production target.
+    So `alembic upgrade head` against a fresh SQLite database applies `0001`
+    through `0004` and then fails on `0005` with a plain SQL syntax error, not
+    with a schema this build can serve. There is no workaround short of
+    PostgreSQL: a database stopped at `0004` is a schema this build's startup
+    check refuses to run against, the same as any other outdated revision.
+
+    This is why the test suite does not migrate its SQLite database at all: it
+    builds the schema straight from the models with `create_all` and stamps it as
+    fully migrated, and a PostgreSQL-only test asserts that what that produces and
+    what the real migrations produce are the same schema. See
+    [Drift is a build failure](#drift-is-a-build-failure) and
+    [Limitations](../reference/limitations.md).
+
+SQLite remains unsupported as a production target, and is no longer usable for
+trying the service out end to end either. Use PostgreSQL.
 
 ## Writing a migration
 

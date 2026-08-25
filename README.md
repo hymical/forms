@@ -72,11 +72,11 @@ crash cannot lose work the service already acknowledged.
 
 ```mermaid
 flowchart TD
-    Form["HTML form"] -->|"public submission"| API["FastAPI API process"]
-    Operator["Operator"] -->|"authenticated management routes"| API
-    API --> DB[("PostgreSQL")]
-    DB --> Worker["Delivery worker process"]
-    Worker -->|"signed HTTP POST"| Receiver["Your webhook receiver"]
+    Form["Browser / HTML form"] -->|"POST /f/{endpoint_id}, public"| API["FastAPI API"]
+    Operator["Operator"] -->|"authenticated management API"| API
+    API -->|"submission + delivery job, one transaction"| DB[("PostgreSQL")]
+    DB --> Worker["Delivery worker"]
+    Worker -->|"HMAC signed webhook"| Receiver["Developer endpoint"]
     Worker --> DB
 ```
 

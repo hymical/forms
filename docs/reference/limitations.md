@@ -138,9 +138,16 @@ deploy it, and it is kept complete rather than flattering.
   absorb and the ingestion path never pays because it is not authenticated. A
   failure to write it is logged and ignored rather than allowed to turn a valid
   credential into a `401`.
-- **SQLite is not a production target.** It backs the test suite and local
-  experimentation. It has no row locking, which several parts of this service rely
-  on. See [Concurrency](../architecture/concurrency.md).
+- **SQLite is not a production target.** It backs the test suite. It has no row
+  locking, which several parts of this service rely on. See
+  [Concurrency](../architecture/concurrency.md).
+- **A fresh SQLite database cannot be migrated to the current schema.** Revision
+  `0005` alters two tables with foreign keys between them directly rather than
+  through Alembic's batch mode, which is what SQLite needs to change a column at
+  all, so `alembic upgrade head` reaches `0004` on SQLite and then fails. It is
+  written for PostgreSQL, which does not have this restriction. The test suite is
+  unaffected: it builds its SQLite schema from the models rather than migrating
+  it. See [Database migrations](../operations/migrations.md#sqlite).
 
 ## Not implemented at all
 
