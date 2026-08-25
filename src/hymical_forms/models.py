@@ -1,6 +1,7 @@
 """
-the persisted schema: endpoints, the submissions addressed to them, and the
-management credentials that administer the service
+the persisted schema: endpoints, the submissions addressed to them, the
+management credentials that administer the service, and the traffic counters
+that protect public ingestion
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from hymical_forms.ingestion import (
     SUBMISSION_ID_MAX_LENGTH,
 )
 from hymical_forms.ingestion import Submission as DomainSubmission
+from hymical_forms.ratelimit import LIMITER_MAX_LENGTH, SUBJECT_MAX_LENGTH
 from hymical_forms.webhooks import (
     DELIVERY_ATTEMPT_ID_MAX_LENGTH,
     DELIVERY_ERROR_MAX_LENGTH,
@@ -391,3 +393,41 @@ class ManagementApiKey(Base):
         :returns: True if the key has not been revoked
         """
         return self.revoked_at is None
+
+
+class RateLimitCounter(Base):
+    """
+    how many public submission attempts one subject made inside one fixed window
+    """
+
+    # The shared state the public ingestion limiters decide on. It is here rather
+    # than in process memory because a limit enforced per process is not a limit:
+    # two API replicas would each allow the configured number and the service
+    # would accept twice it, and an autoscaler would raise the real ceiling every
+    # time it added a replica.
+    #
+    # This is the one table in the schema that holds no durable record of
+    # anything. Every row is disposable, it stops being consulted the moment its
+    # window ends, and losing the whole table costs at most one window of
+    # accounting. That is what makes the counters cheap to write on the hot path
+    # and safe to delete in bulk.
+    __tablename__ = "rate_limit_counters"
+
+    # The three parts of the identity are the primary key, which makes the index
+    # that the atomic upsert conflicts on the same index the read rides on. There
+    # is no surrogate key because nothing ever refers to one of these rows.
+    limiter: Mapped[str] = mapped_column(String(LIMITER_MAX_LENGTH), primary_key=True)
+
+    # An endpoint identifier for the per-endpoint limiter, and a digest of the
+    # client address for the per-IP one. No raw address is stored here, and
+    # neither is anything a submission carried: this table sees a subject and a
+    # count, never a field name, a value or a credential.
+    subject: Mapped[str] = mapped_column(String(SUBJECT_MAX_LENGTH), primary_key=True)
+
+    # Floored to the window boundary, so every process writing this row derives
+    # the same value from the same instant. Indexed on its own as well as being
+    # the last part of the key, because cleanup ranges over it without knowing a
+    # limiter or a subject and the composite key cannot answer that.
+    window_start: Mapped[datetime] = mapped_column(UtcDateTime, primary_key=True, index=True)
+
+    attempts: Mapped[int] = mapped_column()

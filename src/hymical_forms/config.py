@@ -1,8 +1,9 @@
 """
 application settings, read from ``FORMS_``-prefixed environment variables
 
-Settings are added only when the code actually uses them, so this model is
-currently limited to the ingestion boundary's protective limits.
+Settings are added only when the code actually uses them, so this model covers
+the ingestion boundary's protective limits, the traffic limits that guard public
+ingestion, and what the delivery worker needs, and nothing speculative.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from hymical_forms.ratelimit import RateLimit
 from hymical_forms.webhooks import RetryPolicy
 
 
@@ -105,6 +107,56 @@ class Settings(BaseSettings):
         ),
     )
 
+    rate_limit_enabled: bool = Field(
+        default=True,
+        description=(
+            "Enforce the public ingestion rate limits. On by default, because a "
+            "public route with no limit is the exposure this exists to close. "
+            "Turn it off only for local development or a test that is about "
+            "something else."
+        ),
+    )
+    rate_limit_ip_requests: int = Field(
+        default=60,
+        ge=1,
+        description="Public submission attempts one source address may make per window.",
+    )
+    rate_limit_ip_window_seconds: int = Field(
+        default=60,
+        ge=1,
+        description="How long the per-address window lasts, in seconds.",
+    )
+    rate_limit_endpoint_requests: int = Field(
+        default=600,
+        ge=1,
+        description="Public submission attempts one endpoint may receive per window.",
+    )
+    rate_limit_endpoint_window_seconds: int = Field(
+        default=60,
+        ge=1,
+        description="How long the per-endpoint window lasts, in seconds.",
+    )
+    rate_limit_ip_secret: str | None = Field(
+        default=None,
+        min_length=16,
+        description=(
+            "Secret keying the digest that client addresses are counted under. "
+            "Optional: without it the digest is unkeyed, which keeps addresses out "
+            "of the table but is not privacy against anyone who can read it. Every "
+            "API process must be given the same value."
+        ),
+    )
+    trusted_proxy_hops: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "How many reverse proxies of your own stand in front of this process. "
+            "0, the default, means the client address is the socket peer and "
+            "X-Forwarded-For is ignored. Set it to the real number of hops, never "
+            "higher, or clients can choose their own rate limit bucket."
+        ),
+    )
+
     def retry_policy(self) -> RetryPolicy:
         """
         gather the retry settings into the value the delivery code works with
@@ -114,4 +166,24 @@ class Settings(BaseSettings):
             max_attempts=self.webhook_max_attempts,
             initial_seconds=self.webhook_retry_initial_seconds,
             max_seconds=self.webhook_retry_max_seconds,
+        )
+
+    def ip_rate_limit(self) -> RateLimit:
+        """
+        gather the per-address limit into the value the limiter works with
+        :returns: the configured per-address rate limit
+        """
+        return RateLimit(
+            requests=self.rate_limit_ip_requests,
+            window_seconds=self.rate_limit_ip_window_seconds,
+        )
+
+    def endpoint_rate_limit(self) -> RateLimit:
+        """
+        gather the per-endpoint limit into the value the limiter works with
+        :returns: the configured per-endpoint rate limit
+        """
+        return RateLimit(
+            requests=self.rate_limit_endpoint_requests,
+            window_seconds=self.rate_limit_endpoint_window_seconds,
         )

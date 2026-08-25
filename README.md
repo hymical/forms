@@ -45,30 +45,33 @@ same authenticated management API.
 
 Everything that administers the service requires a management API key. Form
 ingestion stays public, because an ingestion URL is meant to sit in the `action`
-attribute of somebody's HTML form. There is still no rate limiting and no spam
-protection, so a public deployment is exposed to whatever volume the internet
-sends it.
+attribute of somebody's HTML form. Public submissions are now rate limited per
+source address and per endpoint, which bounds the volume one deployment will
+accept. That is traffic protection and nothing more: **there is still no spam
+protection**, no CAPTCHA and no content classification, so a public deployment
+will accept junk up to the configured rate.
 
-| Capability                    | Status                    |
-| ----------------------------- | ------------------------- |
-| Health endpoint               | Implemented               |
-| Form ingestion + validation   | Implemented               |
-| Request limits + error model  | Implemented               |
-| Endpoint registry             | Implemented               |
-| Submission persistence        | Implemented               |
-| Idempotent retries            | Implemented               |
-| Signed webhook delivery       | Implemented               |
-| Durable delivery queue        | Implemented               |
-| Retries with backoff          | Implemented               |
-| Schema migrations             | Implemented               |
-| API keys / authentication     | Implemented               |
-| Endpoint management           | Implemented               |
-| Delivery inspection           | Implemented               |
-| Manual delivery replay        | Implemented               |
-| Endpoint deletion             | **Not implemented**       |
-| Submission retrieval          | **Not implemented**       |
-| Rate limiting, spam handling  | **Not implemented**       |
-| Export, retention, dashboards | **Not implemented**       |
+| Capability                     | Status                    |
+| ------------------------------ | ------------------------- |
+| Health endpoint                | Implemented               |
+| Form ingestion + validation    | Implemented               |
+| Request limits + error model   | Implemented               |
+| Endpoint registry              | Implemented               |
+| Submission persistence         | Implemented               |
+| Idempotent retries             | Implemented               |
+| Signed webhook delivery        | Implemented               |
+| Durable delivery queue         | Implemented               |
+| Retries with backoff           | Implemented               |
+| Schema migrations              | Implemented               |
+| API keys / authentication      | Implemented               |
+| Endpoint management            | Implemented               |
+| Delivery inspection            | Implemented               |
+| Manual delivery replay         | Implemented               |
+| Public ingestion rate limiting | Implemented               |
+| Endpoint deletion              | **Not implemented**       |
+| Submission retrieval           | **Not implemented**       |
+| Spam handling, CAPTCHA         | **Not implemented**       |
+| Export, retention, dashboards  | **Not implemented**       |
 
 ## Requirements
 
@@ -134,7 +137,7 @@ database is reachable and at the migration revision the build was written
 against, and refuse to start otherwise:
 
 ```
-the database is at migration '0002' but this build expects '0003'.
+the database is at migration '0003' but this build expects '0004'.
 Run 'alembic upgrade head' before starting.
 ```
 
@@ -540,6 +543,11 @@ Accepts a form submission for a registered endpoint and stores it.
 has no way to send. No management credential is read here, and one sent anyway
 is ignored rather than forwarded anywhere.
 
+**It is rate limited**, per source address and per endpoint, and an attempt over
+either limit is refused with `429 rate_limit_exceeded` and a `Retry-After`
+header. See [Rate limits](#rate-limits) for the defaults, what counts as an
+attempt, and how the client address is determined.
+
 A submission to an ID that does not exist is rejected with
 `404 endpoint_not_found`, and one to an inactive endpoint with
 `409 endpoint_inactive`. Neither leaves anything in the database.
@@ -574,6 +582,160 @@ Submitted values are not echoed back, because the client already has them.
 No outbound request is made during this request, so the response says nothing
 about whether a destination is reachable: that is the worker's business, and a
 destination being down can no longer affect whether a form is accepted.
+
+### Rate limits
+
+`POST /f/{endpoint_id}` is public and stays public, which means anyone who can
+reach it can send it traffic. Two limits bound how much.
+
+| Limit           | Counts                                              | Default            |
+| --------------- | --------------------------------------------------- | ------------------ |
+| Per source      | Attempts one client address makes, across every endpoint | 60 per 60 seconds  |
+| Per endpoint    | Attempts one endpoint receives, from every source together | 600 per 60 seconds |
+
+A submission must satisfy **both**. The per-source limit stops one client
+flooding many endpoints; the per-endpoint limit stops one endpoint consuming the
+whole deployment's capacity, including under an attack spread across thousands of
+addresses that each stay under the per-source limit.
+
+Neither limit applies to `GET /health` or to any management route. Ingestion
+traffic cannot lock an operator out of their own service.
+
+#### Being refused
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 30
+```
+
+```json
+{
+  "error": {
+    "code": "rate_limit_exceeded",
+    "message": "Too many submission attempts. Try again in 30 seconds.",
+    "details": {
+      "scope": "ip",
+      "limit": 60,
+      "window_seconds": 60,
+      "retry_after_seconds": 30
+    }
+  }
+}
+```
+
+`scope` is `ip` or `endpoint`, and `Retry-After` is whole seconds until the
+window that refused you ends. Which limit tripped is told to you deliberately: a
+developer whose own client is looping and one whose form is being flooded from
+elsewhere need to do completely different things about it, and anybody could
+distinguish the two anyway by trying the same endpoint from a second address.
+What is never returned is the counter, the subject it is keyed by, or anything
+naming a column.
+
+#### What counts as an attempt
+
+Every request that reaches the ingestion route spends a unit of budget, **whether
+or not it is accepted**. A malformed body, an unsupported content type, an empty
+submission and a submission to a disabled endpoint all cost the sender the same
+as a successful one, because they all cost this service the same work. Abuse
+traffic that is invalid is still abuse traffic.
+
+The order is fixed and worth knowing:
+
+| Step                                | Effect                                                     |
+| ----------------------------------- | ---------------------------------------------------------- |
+| Body size cap, in middleware         | An oversized body is refused with `413` and spends nothing  |
+| Per-source limit                     | Always spent, before the endpoint ID is even checked        |
+| Endpoint lookup                      | An unknown endpoint returns `404`                           |
+| Per-endpoint limit                   | Spent for any endpoint that exists, active or not           |
+| Content type, body parse, storage    | Only reached once both limits have allowed the attempt      |
+
+Two consequences follow from that order, and both are deliberate:
+
+- **An attempt the endpoint limit refuses has already spent the source's
+  budget.** Otherwise hammering a saturated endpoint would be free, and an
+  attacker could keep a source address permanently under its own limit while
+  doing nothing but flooding.
+- **An attempt the source limit refuses does not spend an endpoint's budget.**
+  The endpoint is never looked up, so a blocked address cannot burn through the
+  budget of an endpoint it is not being allowed to reach. A submission to an
+  endpoint ID that does not exist spends the source's budget and creates no
+  endpoint counter, so guessing identifiers cannot be used to choose how much
+  this table grows.
+
+**Idempotent replays count.** A repeated `Idempotency-Key` is still a request
+that crosses the network and reaches the database, and exempting it would make
+one leaked key an unlimited way past both limits. A replay the limits allow
+behaves exactly as it did before: it returns the original submission and queues
+no second delivery.
+
+#### Which address you are counted as
+
+By default the client address is the **socket peer address** the ASGI server
+reports, and `X-Forwarded-For` is ignored entirely. That header is text the
+client writes, so trusting it by default would hand every client its own private
+rate limit.
+
+**If you run this behind a reverse proxy, the socket peer is your proxy**, and
+without configuration every visitor would share one bucket. Set
+`FORMS_TRUSTED_PROXY_HOPS` to the number of proxies of your own in front of the
+process:
+
+```bash
+FORMS_TRUSTED_PROXY_HOPS=1
+```
+
+Each proxy appends the address it saw, so the entry that many places from the
+**right** of `X-Forwarded-For` is the one your outermost proxy observed;
+everything to the left of it was written by somebody who is not yours to trust.
+Set it to the real number of hops and never higher: a value larger than your
+actual chain lets a client insert entries and pick its own bucket. If the header
+is missing, or carries fewer entries than you configured, the socket peer is used
+instead rather than the header being half believed. Make sure your proxy is
+actually appending the header (nginx: `proxy_set_header X-Forwarded-For
+$proxy_add_x_forwarded_for`).
+
+Addresses are stored as a SHA-256 digest, never as text, and no route or log line
+returns one. Setting `FORMS_RATE_LIMIT_IP_SECRET` keys that digest with HMAC and
+makes it genuinely one way; without it the digest is obfuscation only, because the
+IPv4 space is small enough for anybody holding the table to enumerate. The usual
+argument against adding a second secret does not apply here: these counters live
+for one window, so changing or losing the secret costs at most one window of
+accounting. Every API process must be given the same value.
+
+#### How the limits are enforced
+
+Counters are rows in PostgreSQL, keyed by limiter, subject and window start, and
+incremented with a single `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`. That
+one statement is the whole concurrency argument: reading a counter, comparing it
+in Python and writing it back would let two simultaneous requests both see room
+and both pass. Here the database settles it and hands each request a different
+number, so at most one of them can be the last one under the limit. This is
+tested against real PostgreSQL with several independently built applications,
+each with its own engine and connection pool, submitting at the same instant.
+
+**The limit is shared, not per process.** Two API replicas enforce one limit
+between them rather than one each, which is the entire reason the state is in the
+database. There is no Redis, no external rate-limit service and no sticky-session
+requirement.
+
+The algorithm is a **fixed window**: the current window is `now` floored to a
+multiple of the window length, against the Unix epoch, so every process derives
+the same boundary. It is deterministic and cheap, and its known weakness is the
+boundary. A client that spends a whole window just before it ends and another
+just after can make twice the configured requests across those two windows. A
+sliding window or token bucket would smooth that out at the cost of keeping a log
+of request instants or a refill timestamp, which is not worth it for a first
+layer whose job is to stop unbounded traffic rather than shape well-behaved
+traffic.
+
+Old windows are removed opportunistically: a small fraction of submission
+attempts also delete counters whose window ended several windows ago. The cutoff
+is far enough back that a sweep can never take a window still being counted in,
+and the delete rides an index on the window column rather than scanning. There is
+no extra daemon to deploy for it.
+
+Set `FORMS_RATE_LIMIT_ENABLED=false` to turn all of this off for local
+development. It is on by default, and should stay on in production.
 
 ### Retrying safely with `Idempotency-Key`
 
@@ -1033,6 +1195,7 @@ add.
 | 409    | `delivery_not_replayable`  | Delivery has not terminally failed                        |
 | 413    | `request_body_too_large`   | Body exceeded `FORMS_MAX_BODY_BYTES`                      |
 | 415    | `unsupported_media_type`   | Content type is not a supported form encoding             |
+| 429    | `rate_limit_exceeded`      | A public ingestion rate limit was exhausted               |
 | 422    | `empty_submission`         | No fields were submitted                                  |
 | 422    | `invalid_cursor`           | Pagination cursor does not continue from a known row      |
 | 422    | `invalid_endpoint_id`      | Endpoint ID in a request body breaks the ID rules         |
@@ -1049,6 +1212,10 @@ Ingestion rule codes are `too_many_fields`, `field_name_too_long`,
 `invalid_endpoint_id` carries a different status depending on where the ID came
 from: `404` when it arrived as a submission path that addresses nothing, `422`
 when it arrived as a field in a request body.
+
+`rate_limit_exceeded` is the one error that carries a `Retry-After` header, in
+whole seconds. Its `details` name which limit tripped and how long its window is;
+see [Rate limits](#rate-limits).
 
 Both `401`s carry `WWW-Authenticate: Bearer`. They are deliberately `401` and
 not `403`: a `403` says the caller is known and not permitted, which needs a
@@ -1078,6 +1245,18 @@ All settings are read from `FORMS_`-prefixed environment variables, or from a
 | `FORMS_WORKER_POLL_SECONDS`             | `1`     | How often an idle worker looks for work    |
 | `FORMS_WORKER_BATCH_SIZE`               | `10`    | Deliveries a worker claims at once         |
 | `FORMS_WORKER_LEASE_SECONDS`            | `60`    | How long a worker's claim holds            |
+| `FORMS_RATE_LIMIT_ENABLED`              | `true`  | Enforce the public ingestion rate limits   |
+| `FORMS_RATE_LIMIT_IP_REQUESTS`          | `60`    | Attempts one source address may make per window |
+| `FORMS_RATE_LIMIT_IP_WINDOW_SECONDS`    | `60`    | How long the per-address window lasts      |
+| `FORMS_RATE_LIMIT_ENDPOINT_REQUESTS`    | `600`   | Attempts one endpoint may receive per window |
+| `FORMS_RATE_LIMIT_ENDPOINT_WINDOW_SECONDS` | `60` | How long the per-endpoint window lasts     |
+| `FORMS_RATE_LIMIT_IP_SECRET`            | unset   | Secret keying the digest addresses are counted under |
+| `FORMS_TRUSTED_PROXY_HOPS`              | `0`     | Reverse proxies of your own in front of this process |
+
+The rate limit settings apply only to `POST /f/{endpoint_id}`; see
+[Rate limits](#rate-limits). `FORMS_TRUSTED_PROXY_HOPS` is security-sensitive:
+leaving it at `0` behind a proxy makes every visitor share one bucket, and
+setting it higher than your real chain lets clients pick their own.
 
 There is deliberately no setting for a management API key. Keys live in the
 database so that creating and revoking one needs no restart, and so that a
@@ -1118,6 +1297,14 @@ downgrade removes only what the newer revision added, and that the data survives
 that too. Another settles the manual replay race: several real connections
 replay one failed delivery at the same instant, and exactly one of them wins.
 
+The rate limit suite there is the one that could not be faked. It builds several
+whole applications, each with its own engine and connection pool, and has them
+submit at the same instant against one database. Exactly the configured number of
+attempts is accepted and the rest are refused, no increment is lost, and a budget
+one application spent is already spent for another that has never seen the client
+before, which is what "shared enforcement rather than process-local state"
+actually has to mean.
+
 CI runs the lint, format and type checks once, the fast suite across Python
 3.11 to 3.13, and the PostgreSQL suite once against a PostgreSQL 17 service.
 
@@ -1135,6 +1322,7 @@ src/hymical_forms/
   ingestion.py      domain rules: endpoint IDs, submission validation
   middleware.py     request body size limit
   models.py         the persisted schema
+  ratelimit.py      rate limit rules: windows, subjects, client address trust
   storage.py        queries and writes
   webhooks.py       webhook rules: URL validation, payload, signature, retry policy
   worker.py         the delivery worker process
@@ -1149,8 +1337,8 @@ src/hymical_forms/
   migrations/       Alembic environment and revisions
 ```
 
-`ingestion.py`, `webhooks.py` and `apikeys.py` hold the domain rules and know
-nothing about HTTP or the database. `models.py` and `storage.py` are the only
+`ingestion.py`, `webhooks.py`, `apikeys.py` and `ratelimit.py` hold the domain
+rules and know nothing about HTTP or the database. `models.py` and `storage.py` are the only
 modules that write queries, and `delivery.py` is the only one that makes an
 outbound request. `api/` translates requests into domain rules and storage calls,
 and their outcomes into responses. `api/security.py` holds the one authentication
@@ -1206,6 +1394,17 @@ judging it in Python and then writing it would let both requests pass the check
 and both reset the retry cycle, which is the duplicated work this exists to
 prevent.
 
+Rate limit counters are the one table here that records nothing durable. A row is
+a limiter, a subject and a window start, all three of which are the primary key,
+so the index the key already creates is the index the increment conflicts on and
+there is no second structure to keep in agreement with it. The increment is a
+single `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`, committed on its own
+rather than inside the submission's transaction, so a submission that is refused
+or fails to store cannot roll back the accounting that refused it. Every row
+stops being consulted the moment its window ends, which is what makes bulk
+deletion of old windows safe and why the whole table can be lost for the price of
+one window of accounting.
+
 The two attempt counters on a delivery are what let a replay be both honest and
 useful. `attempts` is the lifetime total and only ever rises, so it can number
 the audit trail without a number ever being reused. `cycle_attempts` is the
@@ -1246,9 +1445,27 @@ database sets one from the other.
   Treat the current checks as a guardrail against mistakes, not a defence against
   an attacker who can configure endpoints. Authentication narrows who that is to
   whoever holds a management key; it does not make the checks complete.
-- **Form ingestion is public and unrated.** Anyone who can reach the API can post
-  to any active endpoint. There is no rate limiting, no spam protection and no
-  CAPTCHA, so a public deployment accepts whatever volume it is sent.
+- **Rate limiting is traffic protection, not spam protection.** It bounds how
+  much a source or an endpoint can send; it has no opinion whatsoever about what
+  is in a submission. There is no CAPTCHA, no Turnstile, no content or ML
+  classification, no honeypot field, no disposable-email detection and no email
+  verification, so a public deployment still accepts junk up to the configured
+  rate. Form ingestion is public by design and stays that way.
+- **The rate limit windows are fixed, so the boundary is soft.** A client that
+  spends a whole window just before it ends and another just after can make twice
+  the configured requests across those two windows. Set the window shorter if
+  that burst matters more to you than the smaller counters a longer window keeps.
+- **The client address is only as trustworthy as your deployment.** Behind a
+  reverse proxy, `FORMS_TRUSTED_PROXY_HOPS` must match your real chain. Left at
+  `0` every visitor shares your proxy's bucket, and set too high a client can
+  forge `X-Forwarded-For` entries and pick its own. The default trusts nothing
+  but the socket peer, which is the safe end to fail towards but is wrong behind
+  a proxy.
+- **Rate limiting adds writes to the ingestion path.** Every public attempt costs
+  one upsert per limiter, committed before the body is parsed. That is the price
+  of a limit that is shared across processes rather than enforced per process,
+  and it means the limiter fails closed: if the database is unreachable, the
+  attempt is refused with `503` rather than let through uncounted.
 - **A lost management key cannot be recovered,** only replaced. The server holds
   a digest and nothing else. Create a new key, move your callers onto it, and
   revoke the old one by the key ID `list-keys` still shows.
