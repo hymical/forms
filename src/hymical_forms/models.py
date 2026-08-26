@@ -37,6 +37,7 @@ from hymical_forms.ingestion import (
 from hymical_forms.ingestion import Submission as DomainSubmission
 from hymical_forms.ratelimit import LIMITER_MAX_LENGTH, SUBJECT_MAX_LENGTH
 from hymical_forms.webhooks import (
+    CLAIM_TOKEN_MAX_LENGTH,
     DELIVERY_ATTEMPT_ID_MAX_LENGTH,
     DELIVERY_ERROR_MAX_LENGTH,
     DELIVERY_STATE_MAX_LENGTH,
@@ -330,6 +331,18 @@ class WebhookDelivery(Base):
     # claimable again, which is what stops a worker that died mid-delivery from
     # leaving a permanent ``processing`` tombstone.
     claim_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime, default=None)
+
+    # Which claim the row is currently holding. A fresh value is minted every time
+    # the delivery is claimed and cleared the moment it stops being claimed, so it
+    # says *which* claim rather than when one ends.
+    #
+    # That distinction is the whole reason it exists. A worker whose lease ran out
+    # while its request was still in flight is still looking at a ``processing``
+    # row, so neither the state nor the lease tells it that the delivery has been
+    # taken over. The token does: it presents the one it claimed under, no longer
+    # matches, and its completion is refused rather than overwriting the newer
+    # owner's state.
+    claim_token: Mapped[str | None] = mapped_column(String(CLAIM_TOKEN_MAX_LENGTH), default=None)
 
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, default=None)

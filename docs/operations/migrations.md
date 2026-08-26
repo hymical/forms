@@ -71,6 +71,8 @@ the DDL before anything touches it.
 
 Migrations through `0004` replay against SQLite too, in batch mode, because
 SQLite cannot `ALTER` a column in place and has to rebuild the table instead.
+`0006` is a plain `ADD COLUMN`, which SQLite performs happily, but it sits behind
+`0005` and so is unreachable there for the reason below.
 
 !!! warning "A fresh SQLite database cannot reach `head`"
 

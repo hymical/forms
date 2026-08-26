@@ -61,6 +61,12 @@ database of its own, so migrating from genuinely nothing is what is being tested
 never share it. A row another worker holds is skipped rather than waited on. An
 expired lease is reclaimed by exactly one of two racing workers.
 
+**Completion ownership.** Two connections hold two different claims on one
+delivery: a worker whose lease has lapsed, and the worker that legitimately
+reclaimed it. The lapsed worker cannot clear the newer lease, move the state,
+spend the retry cycle or reuse an attempt number, in either result ordering. The
+request it really made is still recorded, under a number of its own.
+
 **Manual replay.** Several real connections replay one failed delivery at the same
 instant, and exactly one of them wins.
 

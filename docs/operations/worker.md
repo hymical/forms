@@ -58,6 +58,12 @@ There is no coordination service and no broker. PostgreSQL is the queue. See
     The defaults leave a wide margin (60 seconds against 15). Keep it that way if
     you change them.
 
+    A lease that runs out mid-request costs you a duplicate send, not a corrupted
+    delivery: the overtaken worker cannot overwrite the state of whoever reclaimed
+    the delivery. It logs a warning saying so, which is the signal that the lease
+    is too short for how long that destination takes to answer. See
+    [Delivery semantics](../architecture/delivery-semantics.md#who-owns-a-claim).
+
 ## Startup checks
 
 The worker performs the same schema check the API does. It reaches the database,

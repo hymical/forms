@@ -40,6 +40,11 @@ WEBHOOK_DELIVERY_ID_PREFIX = "whd_"
 WEBHOOK_DELIVERY_ID_MAX_LENGTH = len(WEBHOOK_DELIVERY_ID_PREFIX) + 32
 DELIVERY_STATE_MAX_LENGTH = 16
 
+# Names one worker's claim on a delivery rather than the delivery itself, so a
+# claim and the claim that later supersedes it are always distinguishable.
+CLAIM_TOKEN_PREFIX = "clm_"
+CLAIM_TOKEN_MAX_LENGTH = len(CLAIM_TOKEN_PREFIX) + 32
+
 # Failure text is written by whatever the destination did, so it is attacker
 # influenced and has to be bounded before it reaches a column.
 DELIVERY_ERROR_MAX_LENGTH = 500
@@ -242,6 +247,17 @@ def new_webhook_delivery_id() -> str:
     :returns: a fresh delivery id such as ``whd_1f0c9a...``
     """
     return f"{WEBHOOK_DELIVERY_ID_PREFIX}{uuid.uuid4().hex}"
+
+
+def new_claim_token() -> str:
+    """
+    generate an identifier for one worker's claim on a delivery
+    :returns: a fresh claim token such as ``clm_1f0c9a...``
+    """
+    # Random rather than counted up from the row, so minting one needs no read of
+    # the delivery it will be written to and two workers reclaiming the same
+    # delivery can never derive the same value.
+    return f"{CLAIM_TOKEN_PREFIX}{uuid.uuid4().hex}"
 
 
 @dataclass(frozen=True, slots=True)

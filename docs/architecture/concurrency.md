@@ -1,7 +1,8 @@
 # Concurrency
 
-Four places in this service have a race, and all four are settled by the database
-rather than by a check in Python.
+Four places in this service have a race, and every one of them is settled by the
+database rather than by a check in Python. The first has two halves: taking a
+delivery, and recording what happened to it.
 
 The pattern is the same every time: **read, compare in application code, then
 write** is never used, because two requests can both read, both find room, and
@@ -31,6 +32,35 @@ keeps the claim correct there.
 **Tested against real PostgreSQL:** six sessions claiming at once partition the
 work and never share it; a locked row is skipped rather than waited on; an
 expired lease is reclaimed by exactly one of two racing workers.
+
+### Recording a result under a claim that was superseded
+
+Claiming and recording are separated by an HTTP request to somebody else's
+server, which can take longer than the lease. So the second half of the claim has
+a race of its own: worker A's lease expires, worker B legitimately reclaims the
+delivery, and *then* A's request comes back.
+
+Each claim mints a `claim_token`, and the transition that records a result is
+conditional on the row still carrying it:
+
+```sql
+UPDATE webhook_deliveries
+SET state = ..., cycle_attempts = ..., claim_expires_at = NULL, claim_token = NULL
+WHERE id = :id AND claim_token = :token
+```
+
+The lease expiry cannot do this job. It says when a claim ends, not which claim it
+is, and A is still looking at a `processing` row, so neither the state nor the
+lease tells A that anything changed. A's update matches no row, and B's state
+stands.
+
+The request A made is still recorded, taking the next free lifetime attempt
+number read under a row lock. See
+[Delivery semantics](delivery-semantics.md#what-happens-to-a-late-attempt).
+
+**Tested against real PostgreSQL** with two connections holding two different
+claims on one row, in both result orderings, so what the fence keys on is
+ownership rather than whether the late worker happened to succeed.
 
 ## 2. Two retries with the same idempotency key
 
