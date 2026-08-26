@@ -54,6 +54,7 @@ from hymical_forms.webhooks import (
     RetryPolicy,
     WebhookTarget,
     is_retryable,
+    new_claim_token,
     new_delivery_attempt_id,
     new_webhook_delivery_id,
 )
@@ -626,7 +627,7 @@ def claim_due_deliveries(
     :param now: the instant to judge dueness against
     :param lease_seconds: how long the claim protects a delivery from other workers
     :param limit: the most deliveries to claim at once
-    :returns: the deliveries this worker now owns
+    :returns: the deliveries this worker now owns, each carrying the token it was claimed under
     """
     delivery = models.WebhookDelivery
     due = due_condition(now)
@@ -642,6 +643,10 @@ def claim_due_deliveries(
     claimed: list[models.WebhookDelivery] = []
     expires_at = now + timedelta(seconds=lease_seconds)
     for candidate in candidates:
+        # A token per claim, not per batch, so reclaiming one delivery of a batch
+        # never lets a stale worker's completion pass for another delivery's.
+        token = new_claim_token()
+
         # The conditional update is the guarantee on backends without row locking:
         # whoever gets there first flips the row out of the due condition, and the
         # loser's update matches nothing. Redundant under SKIP LOCKED, and cheap.
@@ -651,7 +656,11 @@ def claim_due_deliveries(
                 update(delivery)
                 .where(delivery.id == candidate.id)
                 .where(due)
-                .values(state=DeliveryState.PROCESSING, claim_expires_at=expires_at)
+                .values(
+                    state=DeliveryState.PROCESSING,
+                    claim_expires_at=expires_at,
+                    claim_token=token,
+                )
                 .execution_options(synchronize_session="fetch")
             ),
         )
@@ -688,6 +697,22 @@ def load_submissions(
     return {job_id: rows[submission_id] for job_id, submission_id in carried.items()}
 
 
+@dataclass(frozen=True, slots=True)
+class CompletedAttempt:
+    """
+    the attempt that was recorded, and what recording it was allowed to settle
+    """
+
+    # ``owned`` is False when the worker's lease ran out and another worker
+    # reclaimed the delivery while the request was still in flight. The request
+    # was really made and is really recorded, but the delivery's state belongs to
+    # whoever holds the claim now, so ``state`` is that owner's state rather than
+    # anything this worker decided.
+    attempt: models.DeliveryAttempt
+    state: str
+    owned: bool
+
+
 def complete_attempt(
     session: Session,
     delivery: models.WebhookDelivery,
@@ -695,27 +720,52 @@ def complete_attempt(
     *,
     now: datetime,
     policy: RetryPolicy,
-) -> models.DeliveryAttempt:
+    claim_token: str | None,
+) -> CompletedAttempt:
     """
-    record one outbound request and move the delivery to whatever it earned
+    record one outbound request and, if the claim still holds, move the delivery on
     :param session: the session to write through
     :param delivery: the delivery the attempt was made for
     :param result: what the attempt produced
     :param now: the instant the attempt finished
     :param policy: how many attempts are allowed and how long to wait between them
-    :returns: the committed attempt record
+    :param claim_token: the claim the request was made under, as it stood when it was made
+    :returns: the recorded attempt, the delivery's state, and whether the claim still held
     """
     # The audit row and the state it justifies are written together, so the
     # history can never disagree with the job about how many attempts happened.
     #
+    # Everything is decided from the stored row rather than from the loaded
+    # object. The request in between took as long as somebody else's server did,
+    # and the session that claimed this delivery does not expire what it loaded,
+    # so the values read at claim time can be several attempts out of date by the
+    # time a response comes back.
+    row = models.WebhookDelivery
+    reading = select(row.attempts, row.cycle_attempts, row.state, row.claim_token).where(
+        row.id == delivery.id
+    )
+    if session.get_bind().dialect.name == "postgresql":
+        # Held for the rest of this transaction, so the attempt number taken here
+        # and the update that records it cannot be split by another worker. SQLite
+        # has no row locking and serialises writers anyway; it is not a production
+        # target.
+        reading = reading.with_for_update()
+    current = session.execute(reading).one()
+
+    # Ownership is the exact claim, and nothing weaker. A lease that ran out and
+    # was reclaimed leaves the row in ``processing`` with a fresh token, so a test
+    # on the state or on the lease would wave exactly that case through.
+    owned = claim_token is not None and current.claim_token == claim_token
+
     # Two counters, because they answer two different questions. The attempt is
     # numbered from the lifetime total, so a number is never reused however often
-    # the delivery has been replayed. The retry allowance is measured against the
-    # current cycle, so a replayed delivery gets a whole schedule again rather
-    # than failing immediately on a total that is already spent. Until something
-    # is replayed the two are the same number.
-    attempt_number = delivery.attempts + 1
-    cycle_attempt = delivery.cycle_attempts + 1
+    # the delivery has been replayed, and a superseded worker's real request takes
+    # the next free number rather than one the current owner has already spent.
+    # The retry allowance is measured against the current cycle, so a replayed
+    # delivery gets a whole schedule again rather than failing immediately on a
+    # total that is already spent. Only the worker that still owns the claim may
+    # draw on that allowance.
+    attempt_number = current.attempts + 1
     attempt = models.DeliveryAttempt(
         id=new_delivery_attempt_id(),
         delivery_id=delivery.id,
@@ -729,24 +779,38 @@ def complete_attempt(
     )
     session.add(attempt)
 
-    delivery.attempts = attempt_number
-    delivery.cycle_attempts = cycle_attempt
-    delivery.claim_expires_at = None
+    # A superseded worker writes the lifetime total and nothing else. Its request
+    # went out, so the count of requests this delivery has ever produced is the
+    # one thing it is still entitled to change; the state, the lease, the retry
+    # cycle and the schedule all belong to whoever holds the claim now.
+    values: dict[str, Any] = {"attempts": attempt_number}
+    state: str = current.state
+    if owned:
+        cycle_attempt = current.cycle_attempts + 1
+        values |= {"cycle_attempts": cycle_attempt, "claim_expires_at": None, "claim_token": None}
+        if result.outcome is DeliveryOutcome.SUCCEEDED:
+            state = DeliveryState.DELIVERED
+            values |= {"completed_at": now}
+        elif is_retryable(result) and not policy.is_exhausted(cycle_attempt):
+            state = DeliveryState.PENDING
+            values |= {"next_attempt_at": now + policy.delay_after(cycle_attempt)}
+        else:
+            # Either the receiver said something repeating will not fix, or the
+            # allowance ran out. Either way this is the last word on the delivery.
+            state = DeliveryState.FAILED
+            values |= {"completed_at": now}
+        values |= {"state": state}
 
-    if result.outcome is DeliveryOutcome.SUCCEEDED:
-        delivery.state = DeliveryState.DELIVERED
-        delivery.completed_at = now
-    elif is_retryable(result) and not policy.is_exhausted(cycle_attempt):
-        delivery.state = DeliveryState.PENDING
-        delivery.next_attempt_at = now + policy.delay_after(cycle_attempt)
-    else:
-        # Either the receiver said something repeating will not fix, or the
-        # allowance ran out. Either way this is the last word on the delivery.
-        delivery.state = DeliveryState.FAILED
-        delivery.completed_at = now
+    transition = update(row).where(row.id == delivery.id)
+    if owned:
+        # Redundant while the row lock above holds, and the whole of the guarantee
+        # on SQLite, which has none. Same reasoning as the claim's conditional
+        # update, and the same statement proves the claim was still ours.
+        transition = transition.where(row.claim_token == claim_token)
+    session.execute(transition.values(**values).execution_options(synchronize_session=False))
 
     session.commit()
-    return attempt
+    return CompletedAttempt(attempt, str(state), owned)
 
 
 def list_deliveries(
@@ -845,7 +909,10 @@ def requeue_failed_delivery(session: Session, delivery_id: str, *, now: datetime
     # attempt are left exactly as they are: a replay resumes a delivery, it does
     # not start a new one. Clearing ``cycle_attempts`` is what grants the fresh
     # retry allowance, and clearing ``completed_at`` is required by the check
-    # constraint that says a delivery is finished exactly when it says it is.
+    # constraint that says a delivery is finished exactly when it says it is. The
+    # lease and its token are already empty on anything that failed; clearing them
+    # here states the rule that a delivery outside ``processing`` holds no claim
+    # rather than relying on how it got here.
     delivery = models.WebhookDelivery
     result = cast(
         "CursorResult[Any]",
@@ -858,6 +925,7 @@ def requeue_failed_delivery(session: Session, delivery_id: str, *, now: datetime
                 cycle_attempts=0,
                 next_attempt_at=now,
                 claim_expires_at=None,
+                claim_token=None,
                 completed_at=None,
             )
             .execution_options(synchronize_session=False)

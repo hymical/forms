@@ -57,6 +57,12 @@ async def process_batch(
 
     submissions = storage.load_submissions(session, claimed)
 
+    # The claim each request is about to be made under, captured before any of
+    # them go out. Completing is fenced on this rather than on whatever the row
+    # says once a response comes back, so a lease that expires mid-request cannot
+    # let this worker overwrite the state of whoever reclaimed the delivery.
+    claims = {job.id: job.claim_token for job in claimed}
+
     # The network calls overlap so that one unresponsive destination does not
     # hold up the rest of the batch for its whole timeout. They are made with no
     # database transaction open: holding one across somebody else's server would
@@ -77,14 +83,31 @@ async def process_batch(
     # would gain nothing real and would make every retry schedule approximate.
     policy = settings.retry_policy()
     for job, result in zip(claimed, results, strict=True):
-        storage.complete_attempt(session, job, result, now=now, policy=policy)
-        logger.info(
-            "delivery %s attempt %d %s (%s)",
-            job.id,
-            job.attempts,
-            result.outcome,
-            job.state,
+        recorded = storage.complete_attempt(
+            session, job, result, now=now, policy=policy, claim_token=claims[job.id]
         )
+        if recorded.owned:
+            logger.info(
+                "delivery %s attempt %d %s (%s)",
+                job.id,
+                recorded.attempt.attempt_number,
+                result.outcome,
+                recorded.state,
+            )
+        else:
+            # The lease ran out while this request was in flight and another
+            # worker took the delivery over. The request really was sent, so it
+            # stays in the history, but this worker no longer says what the
+            # delivery is. Worth a warning rather than a note: it means the lease
+            # is too short for how long this destination takes to answer.
+            logger.warning(
+                "delivery %s attempt %d %s recorded without ownership, "
+                "the lease expired and another worker now holds it (%s)",
+                job.id,
+                recorded.attempt.attempt_number,
+                result.outcome,
+                recorded.state,
+            )
 
     return len(claimed)
 

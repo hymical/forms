@@ -23,6 +23,49 @@ A delivery is claimable when it is `pending` and due, **or** when it is
 `processing` and its lease has expired. The second case is the whole point: a
 worker that dies holding a job does not strand it in `processing` forever.
 
+## Who owns a claim
+
+A lease says *when* a claim ends. It does not say *which* claim the row is
+holding, and that is a different question with a different answer.
+
+Every claim mints a fresh `claim_token` onto the delivery. A worker records its
+result against the token it claimed under, and that update is conditional on the
+row still carrying it:
+
+```sql
+UPDATE webhook_deliveries
+SET state = ..., cycle_attempts = ..., claim_expires_at = NULL, claim_token = NULL
+WHERE id = :id AND claim_token = :the_token_this_request_was_sent_under
+```
+
+This matters because a worker whose lease ran out mid-request has no way of
+noticing on its own. It is still looking at a row that says `processing`, so
+neither the state nor the lease tells it anything. The token does: once another
+worker has reclaimed the delivery, the token no longer matches, and the late
+worker's transition matches no row.
+
+So a superseded worker **cannot**:
+
+- clear or shorten the current owner's lease
+- move the delivery to `delivered`, `failed` or `pending`
+- spend an attempt from the current owner's retry cycle
+- move `next_attempt_at`
+
+What it still does is record the request it genuinely made. See
+[what happens to a late attempt](#what-happens-to-a-late-attempt) below.
+
+**Tested against real PostgreSQL** with independent connections holding two
+different claims on one row. See [Testing](../development/testing.md).
+
+!!! warning "Every worker has to be on the same build"
+
+    This holds only while every running worker maintains the token. A worker from
+    a build older than the `claim_token` migration neither writes it when it
+    claims nor checks it when it completes, so one left running alongside a newer
+    worker defeats the fence. Stop the old workers, migrate, then start the new
+    ones, which is the [deploy order](../operations/worker.md#deploy-order) this
+    project documents anyway.
+
 ## The crash window
 
 Here is the sequence that produces a duplicate:
@@ -41,6 +84,11 @@ Here is the sequence that produces a duplicate:
     something a webhook receiver offers.
 
 No queue closes this on its own. It needs the receiver's cooperation.
+
+Note what the claim token does and does not change here. It stops a late worker
+from overwriting a newer worker's state. It does **not** stop the request from
+having been sent twice: by the time ownership is checked, both requests have
+already left. Your receiver still has to deduplicate.
 
 ## What you should do about it
 
@@ -88,8 +136,25 @@ ever being reused, however often a delivery is replayed.
 resets it to zero. That is what lets a replay grant a whole fresh schedule rather
 than one last attempt against an allowance that is already spent.
 
-Until something is replayed the two are the same number, which is why the
-migration that introduced the second one backfilled it from the first.
+The two numbers start out equal, which is why the migration that introduced the
+second one backfilled it from the first. They diverge for one of two reasons: the
+delivery was replayed, or a worker that had lost its claim recorded a request it
+really made. Only the current owner may draw on the retry allowance, so a late
+attempt raises `attempts` and leaves `cycle_attempts` alone.
+
+## What happens to a late attempt
+
+A worker whose claim was superseded has usually already made a real HTTP request.
+Somebody's server received it. Discarding that would make the attempt history
+claim fewer requests went out than actually did, so it is recorded:
+
+- it takes the **next free lifetime attempt number**, read from the stored row
+  rather than from whatever the worker held in memory, so no number is reused
+- it raises `attempts`, because the delivery really did produce that request
+- it changes **nothing else**
+
+The number is taken under a row lock, so a late worker and the current owner
+recording at the same instant still get two different numbers.
 
 ## Terminal is terminal, until an operator says otherwise
 

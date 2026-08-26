@@ -18,7 +18,9 @@ deploy it, and it is kept complete rather than flattering.
   than the sum. But if `FORMS_WORKER_LEASE_SECONDS` were set below the connect and
   read timeouts combined, another worker could claim a delivery that is still in
   flight and send it twice. The defaults leave a wide margin; keep it that way if
-  you change them.
+  you change them. The overtaken worker cannot overwrite the newer worker's state,
+  and logs a warning when it finds it has lost the claim, but the duplicate
+  request has already gone out by then.
 - **A signing secret cannot be rotated in place.** Rotation happens only as a side
   effect of changing the destination, so re-keying a receiver that stays at the
   same URL means pointing the endpoint elsewhere and back, or standing up a
