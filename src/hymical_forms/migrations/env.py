@@ -9,12 +9,21 @@ credentials.
 
 from __future__ import annotations
 
+from logging.config import fileConfig
+
 from alembic import context
 from sqlalchemy import Connection
 
 from hymical_forms.config import Settings
 from hymical_forms.db import create_engine_from_url
 from hymical_forms.models import Base
+
+# Only the alembic command reads an ini file. Without this its logging section is
+# never applied and a migration run prints nothing, so an operator cannot tell
+# what it did. A Config built in code (the tests, schema.py) has no file and
+# leaves the caller's logging alone.
+if context.config.config_file_name is not None:
+    fileConfig(context.config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 
