@@ -41,7 +41,9 @@ winner, not a check in application code. See
 [Concurrency](../architecture/concurrency.md).
 
 A replay reports the same `delivery.queued` as the original and does **not**
-queue a second delivery. One submission owes at most one delivery, enforced by a
+queue a second delivery. It describes the stored submission, so adding or
+removing the endpoint's webhook after the original request does not change what a
+replay reports. One submission owes at most one delivery, enforced by a
 unique constraint on the submission.
 
 ## Conflict semantics
