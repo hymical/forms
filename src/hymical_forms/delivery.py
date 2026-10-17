@@ -9,6 +9,8 @@ transaction is ever held open across a call to somebody else's server.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx2
 
 from hymical_forms import __version__
@@ -53,8 +55,28 @@ def create_webhook_client(settings: Settings) -> httpx2.AsyncClient:
     )
 
 
+def attempt_deadline_seconds(settings: Settings) -> float:
+    """
+    work out the longest one delivery attempt is allowed to take, start to finish
+    :param settings: active configuration, read for its timeouts
+    :returns: the overall deadline for one attempt, in seconds
+    """
+    # The client's timeouts each bound a single wait: one connect, one read of
+    # whatever bytes arrive next. None of them bounds the attempt, so a
+    # destination that answers one byte at a time could hold a request open for
+    # as long as it liked, past any lease. Connecting plus one full read timeout
+    # is the most an attempt is worth waiting for, and it is the figure the
+    # operations guide tells operators to size the lease against.
+    return settings.webhook_connect_timeout_seconds + settings.webhook_read_timeout_seconds
+
+
 async def deliver(
-    client: httpx2.AsyncClient, *, url: str, secret: str, body: bytes
+    client: httpx2.AsyncClient,
+    *,
+    url: str,
+    secret: str,
+    body: bytes,
+    deadline_seconds: float,
 ) -> DeliveryResult:
     """
     make one attempt to deliver a signed payload
@@ -62,6 +84,7 @@ async def deliver(
     :param url: the destination to post to
     :param secret: the destination's signing secret
     :param body: the exact bytes to sign and transmit
+    :param deadline_seconds: the longest the whole attempt may take, see attempt_deadline_seconds
     :returns: the outcome, never raising for a destination that misbehaves
     """
     # ``content=body`` transmits these bytes verbatim. Passing the payload object
@@ -74,22 +97,34 @@ async def deliver(
         "User-Agent": USER_AGENT,
     }
 
+    # The response is streamed and its body never read. The status is the whole
+    # answer, and reading a body nobody looks at would let the destination decide
+    # how much memory an attempt takes and how long it lasts.
     try:
-        response = await client.post(url, content=body, headers=headers)
+        async with (
+            asyncio.timeout(deadline_seconds),
+            client.stream("POST", url, content=body, headers=headers) as response,
+        ):
+            status = response.status_code
     except httpx2.TimeoutException as exc:
         return DeliveryResult(DeliveryOutcome.TIMEOUT, error=_describe("timed out", exc))
     except httpx2.RequestError as exc:
         return DeliveryResult(
             DeliveryOutcome.NETWORK_ERROR, error=_describe("could not connect", exc)
         )
+    except TimeoutError:
+        return DeliveryResult(
+            DeliveryOutcome.TIMEOUT,
+            error=f"timed out: no response within the {deadline_seconds:g}s attempt deadline",
+        )
 
-    if 200 <= response.status_code < 300:
-        return DeliveryResult(DeliveryOutcome.SUCCEEDED, response_status=response.status_code)
+    if 200 <= status < 300:
+        return DeliveryResult(DeliveryOutcome.SUCCEEDED, response_status=status)
 
     return DeliveryResult(
         DeliveryOutcome.HTTP_ERROR,
-        response_status=response.status_code,
-        error=f"destination responded with HTTP {response.status_code}",
+        response_status=status,
+        error=f"destination responded with HTTP {status}",
     )
 
 

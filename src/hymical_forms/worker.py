@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import sys
 import threading
 from datetime import datetime
 from types import FrameType
@@ -25,8 +26,9 @@ from sqlalchemy.orm import Session, sessionmaker
 from hymical_forms import storage, webhooks
 from hymical_forms.config import Settings
 from hymical_forms.db import create_engine_from_url, create_session_factory
-from hymical_forms.delivery import create_webhook_client, deliver
+from hymical_forms.delivery import attempt_deadline_seconds, create_webhook_client, deliver
 from hymical_forms.models import utcnow
+from hymical_forms.schema import SchemaNotReady, verify_schema
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,14 @@ async def process_batch(
 
     submissions = storage.load_submissions(session, claimed)
 
+    # Loading the submissions opened a read transaction, and nothing else will
+    # end it before the requests below go out. Ending it here is what keeps the
+    # promise that no transaction is held across somebody else's server.
+    # Committing rather than rolling back, because a rollback would expire the
+    # claimed rows and send the recording step back to the database to reload
+    # them.
+    session.commit()
+
     # The claim each request is about to be made under, captured before any of
     # them go out. Completing is fenced on this rather than on whatever the row
     # says once a response comes back, so a lease that expires mid-request cannot
@@ -71,9 +81,16 @@ async def process_batch(
         job.id: webhooks.serialize_payload(webhooks.build_payload(submissions[job.id]))
         for job in claimed
     }
+    deadline = attempt_deadline_seconds(settings)
     results = await asyncio.gather(
         *(
-            deliver(client, url=job.destination_url, secret=job.signing_secret, body=bodies[job.id])
+            deliver(
+                client,
+                url=job.destination_url,
+                secret=job.signing_secret,
+                body=bodies[job.id],
+                deadline_seconds=deadline,
+            )
             for job in claimed
         )
     )
@@ -83,9 +100,24 @@ async def process_batch(
     # would gain nothing real and would make every retry schedule approximate.
     policy = settings.retry_policy()
     for job, result in zip(claimed, results, strict=True):
-        recorded = storage.complete_attempt(
-            session, job, result, now=now, policy=policy, claim_token=claims[job.id]
-        )
+        try:
+            recorded = storage.complete_attempt(
+                session, job, result, now=now, policy=policy, claim_token=claims[job.id]
+            )
+        except Exception:
+            # Every request in the batch has already gone out. Giving up on the
+            # rest because one could not be recorded would leave them all to be
+            # sent again once their leases ran out. This one is left claimed, so
+            # it is retried after its lease, which is the at-least-once outcome a
+            # worker crashing here would have produced anyway.
+            session.rollback()
+            logger.exception(
+                "delivery %s attempt was made (%s) but could not be recorded, "
+                "it will be retried once its lease expires",
+                job.id,
+                result.outcome,
+            )
+            continue
         if recorded.owned:
             logger.info(
                 "delivery %s attempt %d %s (%s)",
@@ -119,6 +151,25 @@ async def run_worker(settings: Settings, *, stop: threading.Event) -> None:
     :param stop: event that ends the loop once set
     """
     engine = create_engine_from_url(settings.database_url)
+    try:
+        # The same check the API and the CLI make. A worker built for another
+        # revision would claim and complete deliveries under rules the schema no
+        # longer matches, which is worse than not delivering at all.
+        verify_schema(engine)
+    except BaseException:
+        engine.dispose()
+        raise
+
+    deadline = attempt_deadline_seconds(settings)
+    if settings.worker_lease_seconds <= deadline:
+        logger.warning(
+            "FORMS_WORKER_LEASE_SECONDS (%.1fs) does not outlast one delivery attempt "
+            "(%.1fs, the connect and read timeouts combined). Another worker can "
+            "reclaim a delivery that is still in flight and send it twice.",
+            settings.worker_lease_seconds,
+            deadline,
+        )
+
     session_factory: sessionmaker[Session] = create_session_factory(engine)
     client = create_webhook_client(settings)
 
@@ -168,7 +219,11 @@ def main() -> None:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
-    asyncio.run(run_worker(settings, stop=stop))
+    try:
+        asyncio.run(run_worker(settings, stop=stop))
+    except SchemaNotReady as exc:
+        logger.error("the database schema is not ready: %s", exc)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
