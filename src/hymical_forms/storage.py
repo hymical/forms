@@ -24,11 +24,10 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, TypeVar, cast
+from typing import Any, Protocol, Self, TypeVar, cast
 
 from sqlalchemy import (
     ColumnElement,
-    Select,
     and_,
     delete,
     func,
@@ -67,7 +66,25 @@ _Paged = TypeVar("_Paged", models.Endpoint, models.WebhookDelivery, models.Submi
 # Any submission select, whatever it happens to be selecting. The submission
 # filters are applied to a listing, an export and a bounded count alike, and
 # narrowing a select never changes what it returns.
-_Statement = TypeVar("_Statement", bound=Select[Any])
+_Statement = TypeVar("_Statement", bound="_Narrowable")
+
+
+class _Narrowable(Protocol):
+    """
+    a select of any shape, which is all the submission filters need from one
+    """
+
+    # A protocol rather than a bound on ``Select`` itself, because how a select's
+    # row type is spelled changed between SQLAlchemy 2.0 and 2.1 and no single
+    # ``Select[...]`` bound type checks against both.
+    def where(self, *whereclause: ColumnElement[bool]) -> Self:
+        """
+        narrow the select by further conditions
+        :param whereclause: the conditions to add
+        :returns: the narrowed select
+        """
+        ...
+
 
 # How many rows a streamed export pulls from the server at a time. Bounded so
 # that an export builds its response as it goes rather than materialising every
