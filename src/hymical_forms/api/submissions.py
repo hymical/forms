@@ -467,7 +467,7 @@ async def submit(endpoint_id: str, request: Request, session: SessionDep) -> Sub
         received_at=stored.submission.received_at,
         field_count=stored.submission.field_count,
         idempotent_replay=stored.replayed,
-        delivery=DeliveryStatus(queued=webhook is not None),
+        delivery=DeliveryStatus(queued=stored.delivery_queued),
     )
 
 
