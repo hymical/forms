@@ -135,6 +135,7 @@ deploy it, and it is kept complete rather than flattering.
   touches the database. The API and the worker verify the database and its schema
   revision once, at startup, and exit if either is wrong; a database lost after
   that leaves `/health` answering `200` while database-backed routes return `503`.
+  This is deliberate for v1.0, to keep the public surface at two routes.
   See [Deployment](../operations/deployment.md#health-checks).
 - **The container example is an example.** The `Dockerfile` and `compose.yaml`
   run every process as a non-root user, but the compose stack does not terminate

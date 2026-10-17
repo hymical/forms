@@ -125,11 +125,12 @@ There is **no readiness endpoint**. What exists instead:
 - **The worker has no HTTP surface.** Its health is visible only in its logs and in
   whether due deliveries are being drained.
 
-Whether to add a readiness check, and if so on which side of the public and
-management boundary it sits, is an open decision rather than an oversight: every
-route is deliberately either public (`POST /f/{endpoint_id}`, `GET /health`) or
-behind a management key, and a database-checking route would be a new one. See
-[Limitations](../reference/limitations.md#operations).
+Leaving readiness out is a decision for v1.0, not an oversight. Every route is
+deliberately either public (`POST /f/{endpoint_id}`, `GET /health`) or behind a
+management key, and a database-checking route would be a new public one, so the
+public surface stays at those two routes. If you need traffic withdrawn during a
+database outage, have your load balancer or monitoring watch for `503` responses
+from the API. See [Limitations](../reference/limitations.md#operations).
 
 ## Running without containers
 
