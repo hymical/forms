@@ -152,5 +152,6 @@ as migrate-then-restart.
 ## Related
 
 - [Installation](../getting-started/installation.md) for first-time setup
+- [Deployment](deployment.md) for the deploy order with the container image
 - [Testing](../development/testing.md) for the migration test suite
 - [Limitations](../reference/limitations.md)

@@ -175,6 +175,44 @@ def test_a_key_is_scoped_to_one_endpoint(empty_client: TestClient) -> None:
     assert {row.endpoint_id for row in stored(empty_client)} == {"contact-form", "waitlist"}
 
 
+# --- what a replay reports about delivery ------------------------------------
+
+
+def test_a_replay_reports_no_delivery_when_the_webhook_was_added_since(
+    make_client: ClientFactory,
+) -> None:
+    # The replay describes the submission the key was spent on. That one owes no
+    # delivery, so a webhook configured afterwards must not make it claim one.
+    client = make_client(allow_private_webhook_targets=True)
+    first = submit(client)
+    changed = client.patch(
+        "/endpoints/contact-form", json={"webhook_url": "https://hooks.example.com/forms"}
+    )
+    assert changed.status_code == 200, changed.text
+
+    replay = submit(client)
+
+    assert first.json()["delivery"]["queued"] is False
+    assert replay.json()["idempotent_replay"] is True
+    assert replay.json()["delivery"]["queued"] is False
+
+
+def test_a_replay_still_reports_its_delivery_after_the_webhook_is_removed(
+    make_client: ClientFactory,
+) -> None:
+    client = make_client(seed_endpoint=False)
+    create_endpoint(client, webhook_url="https://hooks.example.com/forms")
+    first = submit(client)
+    changed = client.patch("/endpoints/contact-form", json={"webhook_url": None})
+    assert changed.status_code == 200, changed.text
+
+    replay = submit(client)
+
+    assert first.json()["delivery"]["queued"] is True
+    assert replay.json()["idempotent_replay"] is True
+    assert replay.json()["delivery"]["queued"] is True
+
+
 # --- what counts as the same payload -----------------------------------------
 
 

@@ -1,0 +1,90 @@
+# An example deployment: PostgreSQL, a one-shot migration, the API and one
+# worker. A starting point to adapt, not a hardened production stack. See
+# docs/operations/deployment.md.
+#
+#   POSTGRES_PASSWORD=... docker compose up -d --build
+#
+# The password ends up inside FORMS_DATABASE_URL, so if it contains characters
+# that are special in a URL (@ : / % ? #), percent-encode them or pick one that
+# does not.
+
+x-forms-environment: &forms-environment
+  FORMS_DATABASE_URL: postgresql+psycopg://forms:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/forms
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: forms
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: forms
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "forms", "-d", "forms"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    # Deliberately no published port: only the services below need to reach it.
+
+  # All three application services share one image, built from this checkout.
+  # Each declares the build so that none of them tries to pull the tag instead.
+
+  # Applies migrations and exits. The API and the worker wait for it to finish
+  # successfully, and would refuse to start against an unmigrated schema anyway.
+  migrate:
+    build: .
+    image: hymical-forms:local
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      <<: *forms-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: .
+    image: hymical-forms:local
+    environment:
+      <<: *forms-environment
+      # Uncomment and set to the real number of proxies once one stands in front
+      # of the API. Never higher. See docs/operations/reverse-proxy.md.
+      # FORMS_TRUSTED_PROXY_HOPS: "1"
+    ports:
+      # Bound to loopback, so the API is reached through a reverse proxy on this
+      # host rather than exposed directly.
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # Liveness only: /health does not touch the database.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  worker:
+    build: .
+    image: hymical-forms:local
+    command: ["python", "-m", "hymical_forms.worker"]
+    environment:
+      <<: *forms-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # SIGTERM lets the worker finish the batch it holds, which takes up to one
+    # attempt deadline (connect plus read timeout, 15 seconds by default). Docker's
+    # own default of 10 seconds would kill it part way through.
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

@@ -117,8 +117,9 @@ It does not remove the window, and set too low it **creates** duplicates:
 another worker can claim a delivery that is still in flight.
 
 The lease must comfortably outlast `FORMS_WEBHOOK_CONNECT_TIMEOUT_SECONDS` and
-`FORMS_WEBHOOK_READ_TIMEOUT_SECONDS` combined. The defaults leave a wide margin,
-60 seconds against 15. See [Worker](../operations/worker.md).
+`FORMS_WEBHOOK_READ_TIMEOUT_SECONDS` combined, which is the overall deadline every
+attempt is held to. The defaults leave a wide margin, 60 seconds against 15. See
+[Worker](../operations/worker.md).
 
 ## Two attempt counters
 

@@ -181,8 +181,15 @@ Do not enable it in production.
 | `FORMS_WEBHOOK_CONNECT_TIMEOUT_SECONDS` | `5` | Wait for the destination to accept a connection |
 | `FORMS_WEBHOOK_READ_TIMEOUT_SECONDS` | `10` | Wait for the destination to respond |
 
-Both must stay comfortably below `FORMS_WORKER_LEASE_SECONDS`, or another worker
-could claim a delivery that is still in flight. See [Worker](../operations/worker.md).
+Each of these bounds a single wait, so on top of them every attempt has an overall
+deadline of the two combined (15 seconds by default). A destination that answers
+one byte at a time cannot hold a request open past it; such an attempt is
+recorded as a `timeout` and retried. Only the response status is used: the
+response body is never read.
+
+The deadline must stay comfortably below `FORMS_WORKER_LEASE_SECONDS`, or another
+worker could claim a delivery that is still in flight. The worker logs a warning
+at startup if it does not. See [Worker](../operations/worker.md).
 
 ## Related
 

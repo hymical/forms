@@ -8,20 +8,36 @@ nothing here leaves the loopback interface.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
+import logging
+import threading
+import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import OperationalError
 
-from conftest import ClientFactory, app_settings, create_endpoint, open_session, work_once
-from hymical_forms import models, storage
-from hymical_forms.webhooks import DeliveryState, RetryPolicy
+from conftest import (
+    ClientFactory,
+    app_settings,
+    build_settings,
+    create_endpoint,
+    open_session,
+    work_once,
+)
+from hymical_forms import models, storage, worker
+from hymical_forms.db import create_engine_from_url
+from hymical_forms.delivery import create_webhook_client, deliver
+from hymical_forms.schema import SchemaNotReady, create_all
+from hymical_forms.webhooks import DeliveryResult, DeliveryState, RetryPolicy
 from webhook_server import WebhookRecorder, unused_local_url
 
 ENDPOINT = "/f/contact-form"
@@ -627,3 +643,169 @@ def test_the_configured_policy_reaches_the_worker(make_client: ClientFactory) ->
 
     assert policy.max_attempts == 7
     assert policy.initial_seconds == 3
+
+
+# --- bounding one attempt ----------------------------------------------------
+
+
+def test_a_trickling_response_cannot_outlast_the_attempt_deadline(
+    make_client: ClientFactory, webhook: WebhookRecorder
+) -> None:
+    # Each byte arrives well inside the read timeout, so only an overall deadline
+    # can stop this. Without one the attempt runs for as long as the destination
+    # cares to keep writing, which outlives any lease and stalls the whole batch.
+    webhook.trickle_seconds = 0.05
+    client, _ = queued_client(
+        make_client,
+        webhook.url,
+        webhook_connect_timeout_seconds=0.25,
+        webhook_read_timeout_seconds=0.25,
+    )
+    client.post(ENDPOINT, data={"email": "dev@example.com"})
+
+    started = time.monotonic()
+    work_once(client, now=due_at(client))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3
+    attempt = attempts_of(client)[0]
+    assert attempt.outcome == "timeout"
+    assert delivery_of(client).state == DeliveryState.PENDING
+
+
+def test_a_trickling_response_body_does_not_hold_up_a_success(
+    make_client: ClientFactory, webhook: WebhookRecorder
+) -> None:
+    # The status is the whole answer. Reading a body nobody looks at would let a
+    # destination decide how long, and how much memory, an attempt takes.
+    webhook.trickle_seconds = 0.05
+    webhook.trickle_body = True
+    client, _ = queued_client(
+        make_client,
+        webhook.url,
+        webhook_connect_timeout_seconds=0.25,
+        webhook_read_timeout_seconds=0.25,
+    )
+    client.post(ENDPOINT, data={"email": "dev@example.com"})
+
+    started = time.monotonic()
+    work_once(client, now=due_at(client))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3
+    assert attempts_of(client)[0].outcome == "succeeded"
+    assert delivery_of(client).state == DeliveryState.DELIVERED
+
+
+# --- the batch and its transaction -------------------------------------------
+
+
+def test_no_transaction_is_open_while_requests_are_in_flight(
+    make_client: ClientFactory, webhook: WebhookRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, _ = queued_client(make_client, webhook.url)
+    client.post(ENDPOINT, data={"email": "dev@example.com"})
+    settings = app_settings(client)
+    observed: list[bool] = []
+
+    async def run() -> None:
+        webhook_client = create_webhook_client(settings)
+        try:
+            with open_session(client) as session:
+
+                async def watching(*args: Any, **kwargs: Any) -> DeliveryResult:
+                    observed.append(session.in_transaction())
+                    return await deliver(*args, **kwargs)
+
+                monkeypatch.setattr(worker, "deliver", watching)
+                await worker.process_batch(session, webhook_client, settings, now=due_at(client))
+        finally:
+            await webhook_client.aclose()
+
+    asyncio.run(run())
+
+    assert observed == [False]
+    assert delivery_of(client).state == DeliveryState.DELIVERED
+
+
+def test_one_failed_recording_does_not_lose_the_rest_of_the_batch(
+    make_client: ClientFactory, webhook: WebhookRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Every request in the batch has already been sent by the time recording
+    # starts. Abandoning the rest on the first database error would leave them
+    # claimed with nothing recorded, to be sent a second time once the lease runs
+    # out, for no reason other than a neighbour's failure.
+    client, _ = queued_client(make_client, webhook.url)
+    client.post(ENDPOINT, data={"email": "first@example.com"})
+    client.post(ENDPOINT, data={"email": "second@example.com"})
+    real = storage.complete_attempt
+    calls = 0
+
+    def flaky(*args: Any, **kwargs: Any) -> storage.CompletedAttempt:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OperationalError("UPDATE", {}, Exception("connection reset"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(storage, "complete_attempt", flaky)
+    with open_session(client) as session:
+        latest = max(row.next_attempt_at for row in session.scalars(select(models.WebhookDelivery)))
+
+    handled = work_once(client, now=latest)
+
+    assert handled == 2
+    assert len(webhook.received) == 2
+    with open_session(client) as session:
+        states = sorted(row.state for row in session.scalars(select(models.WebhookDelivery)))
+    assert states == [DeliveryState.DELIVERED, DeliveryState.PROCESSING]
+
+
+# --- starting up -------------------------------------------------------------
+
+
+def test_the_worker_refuses_to_start_against_an_unmigrated_database(tmp_path: Path) -> None:
+    settings = build_settings(database_url=f"sqlite:///{tmp_path / 'empty.db'}")
+    stop = threading.Event()
+    stop.set()
+
+    with pytest.raises(SchemaNotReady):
+        asyncio.run(worker.run_worker(settings, stop=stop))
+
+
+def test_the_worker_warns_when_the_lease_cannot_outlast_an_attempt(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    url = f"sqlite:///{tmp_path / 'forms.db'}"
+    engine = create_engine_from_url(url)
+    create_all(engine)
+    engine.dispose()
+    settings = build_settings(
+        database_url=url,
+        worker_lease_seconds=10,
+        webhook_connect_timeout_seconds=5,
+        webhook_read_timeout_seconds=10,
+    )
+    stop = threading.Event()
+    stop.set()
+
+    with caplog.at_level(logging.WARNING, logger="hymical_forms.worker"):
+        asyncio.run(worker.run_worker(settings, stop=stop))
+
+    assert "FORMS_WORKER_LEASE_SECONDS" in caplog.text
+
+
+def test_the_default_lease_draws_no_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    url = f"sqlite:///{tmp_path / 'forms.db'}"
+    engine = create_engine_from_url(url)
+    create_all(engine)
+    engine.dispose()
+    stop = threading.Event()
+    stop.set()
+
+    with caplog.at_level(logging.WARNING, logger="hymical_forms.worker"):
+        asyncio.run(worker.run_worker(build_settings(database_url=url), stop=stop))
+
+    assert "FORMS_WORKER_LEASE_SECONDS" not in caplog.text

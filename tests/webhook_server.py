@@ -35,6 +35,12 @@ class WebhookRecorder:
 
     status: int = 200
     delay_seconds: float = 0.0
+    # When set, the response is written one byte at a time with this gap between
+    # bytes, which no single read ever waits long enough on to time out.
+    # ``trickle_body`` chooses whether the status line and headers arrive
+    # promptly and only the body trickles, or whether the whole response does.
+    trickle_seconds: float = 0.0
+    trickle_body: bool = False
     received: list[ReceivedWebhook] = field(default_factory=list)
     _server: ThreadingHTTPServer | None = None
     _thread: threading.Thread | None = None
@@ -74,9 +80,34 @@ class WebhookRecorder:
                 # timeout is meant to catch.
                 if recorder.delay_seconds:
                     time.sleep(recorder.delay_seconds)
+                if recorder.trickle_seconds:
+                    self._trickle()
+                    return
                 self.send_response(recorder.status)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+
+            def _trickle(self) -> None:
+                """
+                write a response slowly enough to defeat any per-read timeout
+                """
+                body = b"x" * 400
+                head = (
+                    f"HTTP/1.1 {recorder.status} OK\r\nContent-Length: {len(body)}\r\n\r\n"
+                ).encode("ascii")
+                if recorder.trickle_body:
+                    self.wfile.write(head)
+                    self.wfile.flush()
+                    head = b""
+                try:
+                    for byte in head + body:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(recorder.trickle_seconds)
+                except OSError:
+                    # The client gave up and closed the connection, which is the
+                    # behaviour a trickling response is used to provoke.
+                    pass
 
             def log_message(self, format: str, *args: object) -> None:
                 """

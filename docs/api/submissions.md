@@ -87,7 +87,9 @@ Reports that the API process is running.
 
 This is a liveness signal only. It does not check the database, so it stays
 answerable while the database is down, which is what makes it useful for deciding
-whether to restart the process. It is not a readiness check.
+whether to restart the process. It is not a readiness check, and there is no
+separate readiness route. See
+[Deployment](../operations/deployment.md#health-checks).
 
 | Status | Cause |
 | --- | --- |

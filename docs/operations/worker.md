@@ -49,11 +49,13 @@ There is no coordination service and no broker. PostgreSQL is the queue. See
 
 !!! danger "The lease must outlast a delivery attempt"
 
-    A batch is delivered concurrently, so it takes about as long as its slowest
-    single delivery rather than the sum. But if `FORMS_WORKER_LEASE_SECONDS` were
-    set below `FORMS_WEBHOOK_CONNECT_TIMEOUT_SECONDS` and
-    `FORMS_WEBHOOK_READ_TIMEOUT_SECONDS` combined, another worker could claim a
-    delivery that is still in flight and send it twice.
+    Every attempt has an overall deadline of
+    `FORMS_WEBHOOK_CONNECT_TIMEOUT_SECONDS` plus
+    `FORMS_WEBHOOK_READ_TIMEOUT_SECONDS`, however slowly the destination answers.
+    A batch is delivered concurrently, so it takes about as long as that deadline
+    at most rather than the sum. But if `FORMS_WORKER_LEASE_SECONDS` were set at
+    or below the deadline, another worker could claim a delivery that is still in
+    flight and send it twice. The worker logs a warning at startup when it is.
 
     The defaults leave a wide margin (60 seconds against 15). Keep it that way if
     you change them.
@@ -75,14 +77,30 @@ the database is at migration '0003' but this build expects '0004'.
 Run 'alembic upgrade head' before starting.
 ```
 
-Migrating is an operator action, run when the operator chooses. See
-[Database migrations](migrations.md).
+The worker exits with status 1 rather than polling. Migrating is an operator
+action, run when the operator chooses. See [Database migrations](migrations.md).
+
+## Stopping
+
+`SIGTERM` or `SIGINT` asks the worker to finish the batch it is on and exit. A
+batch in flight ends within one attempt deadline, after which its outcomes are
+recorded. A worker killed outright (`SIGKILL`, a crash, a lost host) leaves its
+claimed deliveries in `processing`; they become claimable again once their lease
+expires and are sent again, which is the at-least-once case described in
+[Delivery semantics](../architecture/delivery-semantics.md).
+
+If recording one attempt fails, for example because the database connection
+dropped, the worker logs it and goes on to record the rest of the batch. The
+delivery it could not record stays claimed and is retried after its lease, so the
+destination may receive it twice.
 
 ## Deploy order
 
 Stop the old processes, migrate, start the new ones. Migrating while an old build
 is still running is only safe if the change happens to be backwards compatible,
-and this project does not promise that for any particular migration.
+and this project does not promise that for any particular migration. See
+[Deployment](deployment.md#deploy-order) for the same order with the container
+image.
 
 ## What the worker does not do
 

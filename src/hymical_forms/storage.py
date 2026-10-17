@@ -24,11 +24,10 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, TypeVar, cast
+from typing import Any, Protocol, Self, TypeVar, cast
 
 from sqlalchemy import (
     ColumnElement,
-    Select,
     and_,
     delete,
     func,
@@ -67,7 +66,25 @@ _Paged = TypeVar("_Paged", models.Endpoint, models.WebhookDelivery, models.Submi
 # Any submission select, whatever it happens to be selecting. The submission
 # filters are applied to a listing, an export and a bounded count alike, and
 # narrowing a select never changes what it returns.
-_Statement = TypeVar("_Statement", bound=Select[Any])
+_Statement = TypeVar("_Statement", bound="_Narrowable")
+
+
+class _Narrowable(Protocol):
+    """
+    a select of any shape, which is all the submission filters need from one
+    """
+
+    # A protocol rather than a bound on ``Select`` itself, because how a select's
+    # row type is spelled changed between SQLAlchemy 2.0 and 2.1 and no single
+    # ``Select[...]`` bound type checks against both.
+    def where(self, *whereclause: ColumnElement[bool]) -> Self:
+        """
+        narrow the select by further conditions
+        :param whereclause: the conditions to add
+        :returns: the narrowed select
+        """
+        ...
+
 
 # How many rows a streamed export pulls from the server at a time. Bounded so
 # that an export builds its response as it goes rather than materialising every
@@ -242,8 +259,12 @@ class StoredSubmission:
     the outcome of storing a submission
     """
 
+    # ``delivery_queued`` describes the stored submission, not the endpoint as it
+    # is configured now. A replay answers for the submission the key was spent
+    # on, and the endpoint's webhook may have been added or removed since.
     submission: Submission
     replayed: bool
+    delivery_queued: bool
 
 
 def find_by_idempotency_key(
@@ -292,12 +313,12 @@ def store_submission(
     if idempotency_key is None:
         _add_submission(session, submission, now=now, webhook=webhook)
         session.commit()
-        return StoredSubmission(submission, replayed=False)
+        return StoredSubmission(submission, replayed=False, delivery_queued=webhook is not None)
 
     # Fast path for the ordinary retry, where the first attempt already landed.
     existing = find_by_idempotency_key(session, submission.endpoint_id, idempotency_key)
     if existing is not None:
-        return StoredSubmission(_settle(existing, payload_fingerprint), replayed=True)
+        return _replayed(session, existing, payload_fingerprint)
 
     _add_submission(
         session,
@@ -325,9 +346,27 @@ def store_submission(
             # The violation was something other than the idempotency constraint,
             # so it is not ours to interpret and must not be reported as success.
             raise
-        return StoredSubmission(_settle(existing, payload_fingerprint), replayed=True)
+        return _replayed(session, existing, payload_fingerprint)
 
-    return StoredSubmission(submission, replayed=False)
+    return StoredSubmission(submission, replayed=False, delivery_queued=webhook is not None)
+
+
+def _replayed(
+    session: Session, existing: models.Submission, payload_fingerprint: str | None
+) -> StoredSubmission:
+    """
+    describe the earlier submission a retried request resolved to
+    :param session: the session to query through
+    :param existing: the submission the key was already spent on
+    :param payload_fingerprint: digest of the content submitted this time
+    :returns: the earlier submission, flagged as a replay, with the delivery it actually owes
+    :raises IdempotencyKeyReused: if the content differs from the earlier attempt
+    """
+    settled = _settle(existing, payload_fingerprint)
+    owed = session.scalar(
+        select(models.WebhookDelivery.id).where(models.WebhookDelivery.submission_id == existing.id)
+    )
+    return StoredSubmission(settled, replayed=True, delivery_queued=owed is not None)
 
 
 def _add_submission(

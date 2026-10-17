@@ -131,6 +131,16 @@ deploy it, and it is kept complete rather than flattering.
   lock it, and a build whose expected revision does not match the database refuses
   to start rather than serving against a schema it does not understand. Plan a
   deploy as migrate-then-restart.
+- **There is no readiness check.** `GET /health` is liveness only and never
+  touches the database. The API and the worker verify the database and its schema
+  revision once, at startup, and exit if either is wrong; a database lost after
+  that leaves `/health` answering `200` while database-backed routes return `503`.
+  This is deliberate for v1.0, to keep the public surface at two routes.
+  See [Deployment](../operations/deployment.md#health-checks).
+- **The container example is an example.** The `Dockerfile` and `compose.yaml`
+  run every process as a non-root user, but the compose stack does not terminate
+  TLS, back up PostgreSQL, or ship monitoring. See
+  [Deployment](../operations/deployment.md).
 - **A concurrent `PATCH` on one endpoint is last-write-wins.** The row is locked
   for the transaction on PostgreSQL, so two operators rotating a signing secret at
   the same moment are serialised and both get an answer that matches what was
