@@ -135,4 +135,5 @@ Guidelines that keep the site coherent:
 ## Related
 
 - [Testing](testing.md)
+- [Releasing](releasing.md)
 - [Architecture overview](../architecture/overview.md)

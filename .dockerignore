@@ -1,0 +1,23 @@
+# The image is built from pyproject.toml, README.md, LICENSE, src/ and
+# alembic.ini. Everything else stays out of the build context, and .env above
+# all: configuration reaches a container through its environment, never a file
+# copied into a layer.
+.git
+.github
+.claude
+.context
+.env
+.env.*
+.venv
+venv
+.mypy_cache
+.pytest_cache
+.ruff_cache
+**/__pycache__
+*.pyc
+build
+dist
+site
+docs
+tests
+*.db

@@ -104,6 +104,7 @@ nav:
       - Deliveries: api/deliveries.md
       - Errors: api/errors.md
   - Operations:
+      - Deployment: operations/deployment.md
       - Worker: operations/worker.md
       - Database Migrations: operations/migrations.md
       - Submission Retention: operations/retention.md
@@ -118,6 +119,7 @@ nav:
   - Development:
       - Testing: development/testing.md
       - Contributing: development/contributing.md
+      - Releasing: development/releasing.md
   - Reference:
       - Data Handling: reference/data-handling.md
       - Limitations: reference/limitations.md

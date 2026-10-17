@@ -98,7 +98,9 @@ destination may receive it twice.
 
 Stop the old processes, migrate, start the new ones. Migrating while an old build
 is still running is only safe if the change happens to be backwards compatible,
-and this project does not promise that for any particular migration.
+and this project does not promise that for any particular migration. See
+[Deployment](deployment.md#deploy-order) for the same order with the container
+image.
 
 ## What the worker does not do
 

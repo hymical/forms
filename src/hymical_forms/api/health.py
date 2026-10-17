@@ -30,7 +30,10 @@ async def health() -> HealthResponse:
     report that the api process is running and able to serve requests
     :returns: a liveness payload naming the service and its version
     """
-    # This is a liveness signal only. Hymical Forms has no external dependencies
-    # yet, so there is nothing to distinguish readiness from liveness; a separate
-    # readiness endpoint will arrive with persistence.
+    # Liveness only, and deliberately free of database access, so it keeps
+    # answering while PostgreSQL is down and a supervisor does not restart a
+    # healthy process for an outage it cannot fix. The schema and reachability
+    # check happens once, at startup (see schema.verify_schema). There is no
+    # readiness route: one would be a new public route, which is a boundary
+    # decision rather than something to add here.
     return HealthResponse(status="ok", service="hymical-forms", version=__version__)
