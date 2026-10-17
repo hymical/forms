@@ -56,7 +56,7 @@ value. It must be at least 16 characters.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `FORMS_WEBHOOK_CONNECT_TIMEOUT_SECONDS` | `5` | Wait for a webhook to accept a connection |
-| `FORMS_WEBHOOK_READ_TIMEOUT_SECONDS` | `10` | Wait for a webhook to respond |
+| `FORMS_WEBHOOK_READ_TIMEOUT_SECONDS` | `10` | Wait for a webhook to respond. With the connect timeout, also the overall deadline for one attempt |
 | `FORMS_WEBHOOK_MAX_ATTEMPTS` | `5` | Attempts before a delivery is given up on |
 | `FORMS_WEBHOOK_RETRY_INITIAL_SECONDS` | `10` | Wait before the second attempt; later waits double |
 | `FORMS_WEBHOOK_RETRY_MAX_SECONDS` | `3600` | Cap on the wait between attempts |
