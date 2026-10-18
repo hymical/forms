@@ -59,11 +59,20 @@ Keys are minted by the operator CLI and never over HTTP. Run it as a one-off
 container against the same database:
 
 ```bash
-docker compose run --rm api python -m hymical_forms.cli create-key --name admin
+docker compose run --rm --no-deps api python -m hymical_forms.cli create-key --name admin
 ```
 
 The key is printed once. Store it; it cannot be shown again. See
 [Authentication](../api/authentication.md).
+
+!!! warning "Keep `--no-deps` on every one-off command"
+
+    The `api` service depends on `migrate`, so `docker compose run` without
+    `--no-deps` runs `alembic upgrade head` before the command. After a
+    `docker compose build`, that would migrate the database under the old `api`
+    and `worker`, against the [deploy order](#deploy-order). With `--no-deps` the
+    command only checks the schema revision, like the API and the worker do, and
+    refuses to run against one it does not expect.
 
 ### Retention cleanup
 
@@ -71,8 +80,8 @@ Nothing is deleted automatically. Run the sweep the same way, from whatever
 scheduler you already use:
 
 ```bash
-docker compose run --rm api python -m hymical_forms.cli cleanup-submissions --dry-run
-docker compose run --rm api python -m hymical_forms.cli cleanup-submissions
+docker compose run --rm --no-deps api python -m hymical_forms.cli cleanup-submissions --dry-run
+docker compose run --rm --no-deps api python -m hymical_forms.cli cleanup-submissions
 ```
 
 See [Submission retention](retention.md).
