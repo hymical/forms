@@ -125,3 +125,46 @@ def test_unexpected_errors_do_not_leak_internals() -> None:
         "error": {"code": "internal_error", "message": "The request could not be processed."}
     }
     assert "pa55w0rd" not in response.text
+
+
+# Every place a management request hands a string to the database. PostgreSQL
+# cannot hold a NUL, so before these were checked at the boundary each of them
+# reached the driver and was answered 503 storage_unavailable, reporting a
+# malformed request as an outage. SQLite would have accepted them, which is why
+# the same list is asserted against PostgreSQL in the integration suite.
+NUL_REQUESTS = [
+    ("GET", "/endpoints/a%00b", None, 404, "endpoint_not_found"),
+    ("PATCH", "/endpoints/a%00b", {"is_active": False}, 404, "endpoint_not_found"),
+    ("GET", "/deliveries/a%00b", None, 404, "delivery_not_found"),
+    ("POST", "/deliveries/a%00b/replay", None, 404, "delivery_not_found"),
+    ("GET", "/submissions/a%00b", None, 404, "submission_not_found"),
+    ("GET", "/endpoints?cursor=a%00b", None, 422, "invalid_request"),
+    ("GET", "/deliveries?cursor=a%00b", None, 422, "invalid_request"),
+    ("GET", "/deliveries?endpoint_id=a%00b", None, 422, "invalid_request"),
+    ("GET", "/submissions?endpoint_id=a%00b", None, 422, "invalid_request"),
+    ("GET", "/submissions/export?endpoint_id=a%00b", None, 422, "invalid_request"),
+    ("POST", "/endpoints", {"id": "abc", "name": "a\x00b"}, 422, "invalid_request"),
+    ("PATCH", "/endpoints/contact-form", {"name": "a\x00b"}, 422, "invalid_request"),
+    (
+        "POST",
+        "/endpoints",
+        {"id": "abc", "name": "a", "webhook_url": "https://example.com/\x00"},
+        422,
+        "invalid_webhook_url",
+    ),
+]
+
+
+@pytest.mark.parametrize(("method", "path", "body", "status", "code"), NUL_REQUESTS)
+def test_a_nul_character_is_refused_as_malformed_rather_than_as_an_outage(
+    client: TestClient,
+    method: str,
+    path: str,
+    body: dict[str, object] | None,
+    status: int,
+    code: str,
+) -> None:
+    response = client.request(method, path, json=body)
+
+    assert response.status_code == status
+    assert response.json()["error"]["code"] == code

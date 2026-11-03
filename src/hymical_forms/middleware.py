@@ -66,6 +66,8 @@ class BodySizeLimitMiddleware:
             return
 
         received = 0
+        overflowed = False
+        replaced = False
 
         async def limited_receive() -> Message:
             """
@@ -73,17 +75,40 @@ class BodySizeLimitMiddleware:
             :returns: the next ASGI message
             :raises RequestBodyTooLarge: once the running body total crosses the limit
             """
-            nonlocal received
+            nonlocal received, overflowed
             message = await receive()
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
                 if received > self.max_bytes:
+                    overflowed = True
                     # Raised inside the application, so the registered ApiError
                     # handler renders it in the standard envelope.
                     raise RequestBodyTooLarge(self.max_bytes)
             return message
 
-        await self.app(scope, limited_receive, send)
+        async def guarded_send(message: Message) -> None:
+            """
+            make sure a body cut off for its size is answered as one
+            :param message: the next ASGI response message the application sent
+            """
+            # FastAPI reads JSON bodies itself and converts any exception raised
+            # while reading into its own 400, so on a JSON route the error raised
+            # above never reaches the handler. Once the cap has been crossed, any
+            # other answer is replaced with the 413 the cap is documented to give.
+            nonlocal replaced
+            if replaced:
+                return
+            if (
+                overflowed
+                and message["type"] == "http.response.start"
+                and message["status"] != HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+            ):
+                replaced = True
+                await RequestBodyTooLarge(self.max_bytes).as_response()(scope, receive, send)
+                return
+            await send(message)
+
+        await self.app(scope, limited_receive, guarded_send)
 
 
 def _declared_content_length(scope: Scope) -> int | None:

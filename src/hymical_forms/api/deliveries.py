@@ -29,6 +29,7 @@ from hymical_forms.api.pagination import (
     next_cursor,
 )
 from hymical_forms.api.security import ManagementKeyDep
+from hymical_forms.api.validation import NoNul, contains_nul
 from hymical_forms.db import SessionDep
 from hymical_forms.errors import ApiError, ErrorResponse
 from hymical_forms.ingestion import ENDPOINT_ID_MAX_LENGTH
@@ -50,6 +51,7 @@ EndpointFilter = Annotated[
         max_length=ENDPOINT_ID_MAX_LENGTH,
         description="Only deliveries for this endpoint. Omit for every endpoint.",
     ),
+    NoNul,
 ]
 
 StateFilter = Annotated[
@@ -101,6 +103,30 @@ class DeliveryNotReplayable(ApiError):
             f"Only a delivery that has terminally failed can be replayed. Delivery "
             f"{delivery_id!r} is {state!r}.",
             details={"delivery_id": delivery_id, "state": state},
+        )
+
+
+class DeliverySubmissionDeleted(ApiError):
+    """
+    raised when a replay was asked for a failed delivery whose submission is gone
+    """
+
+    # The same status and code as any other refused replay, so a client that
+    # handles ``delivery_not_replayable`` already handles this. Only the message
+    # and the reason differ, because the remedy does: waiting will not help.
+    status_code = HTTPStatus.CONFLICT
+    code = "delivery_not_replayable"
+
+    def __init__(self, delivery_id: str, state: str) -> None:
+        """
+        report that the delivery has nothing left to deliver
+        :param delivery_id: the delivery the caller asked to replay
+        :param state: the state the delivery is actually in
+        """
+        super().__init__(
+            f"Delivery {delivery_id!r} cannot be replayed because its submission has been "
+            "deleted, so there is no payload left to send.",
+            details={"delivery_id": delivery_id, "state": state, "reason": "submission_deleted"},
         )
 
 
@@ -267,6 +293,9 @@ def get_delivery(
     :returns: the delivery and its attempts, carrying no signing secret
     :raises DeliveryNotFound: if no delivery holds that identifier
     """
+    # A NUL names no delivery, and would fail inside the driver as a 503.
+    if contains_nul(delivery_id):
+        raise DeliveryNotFound(delivery_id)
     delivery = storage.get_delivery(session, delivery_id)
     if delivery is None:
         raise DeliveryNotFound(delivery_id)
@@ -284,7 +313,10 @@ def get_delivery(
     responses={
         401: UNAUTHENTICATED,
         404: {"model": ErrorResponse, "description": "No such delivery"},
-        409: {"model": ErrorResponse, "description": "Delivery has not terminally failed"},
+        409: {
+            "model": ErrorResponse,
+            "description": "Delivery has not terminally failed, or its submission was deleted",
+        },
         503: {"model": ErrorResponse, "description": "Database unavailable"},
     },
 )
@@ -301,6 +333,7 @@ def replay_delivery(
     :returns: the delivery as it now stands, due and waiting for a worker
     :raises DeliveryNotFound: if no delivery holds that identifier
     :raises DeliveryNotReplayable: if the delivery has not terminally failed
+    :raises DeliverySubmissionDeleted: if the delivery's submission no longer exists
     """
     # 200 rather than 202. A 202 would say "your request has been accepted and
     # will be carried out later", which invites reading the replay itself as the
@@ -310,9 +343,13 @@ def replay_delivery(
     #
     # No outbound request is made. This process has no HTTP client to make one
     # with, which is what keeps that guarantee structural rather than a promise.
+    if contains_nul(delivery_id):
+        raise DeliveryNotFound(delivery_id)
     outcome = storage.requeue_failed_delivery(session, delivery_id, now=utcnow())
     if outcome.record is None:
         raise DeliveryNotFound(delivery_id)
+    if not outcome.requeued and outcome.record.submission_id is None:
+        raise DeliverySubmissionDeleted(delivery_id, outcome.record.state)
     if not outcome.requeued:
         # Either the delivery was never failed, or two operators replayed it at
         # once and this is the loser. Both are answered from the state the

@@ -107,6 +107,23 @@ to count back from the right. Setting it higher than your real chain is a
 vulnerability, not a misconfiguration: it lets a client choose its own bucket.
 See [Reverse proxy](../operations/reverse-proxy.md).
 
+Every line of a repeated header is read, as one list, so a proxy that adds its own
+line cannot leave the client's line as the one that counts. The resolved address
+is reduced to a bucket before it is counted: a port is dropped, an IPv4-mapped
+address counts as IPv4, and an IPv6 address counts as its `/64`. Without that, a
+port that changes per connection or a subscriber's `/64` would each be a supply
+of fresh budgets.
+
+## Malformed input fails as malformed input
+
+A request the service cannot act on is answered as the client's mistake, never as
+an outage. In particular, a NUL character, which PostgreSQL cannot store, is
+refused before it reaches the database: in a path identifier it is `404`, as for
+any identifier that names nothing, and in a query parameter or a body field it is
+`422 invalid_request`. Left to the database it surfaced as `503
+storage_unavailable`, telling the client to retry something that could never
+succeed.
+
 ## Known gaps
 
 - **No user, account or role model.** Every valid management key can do
