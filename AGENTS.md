@@ -70,6 +70,7 @@ the same change if you do.
 | `api/deliveries.py` | Delivery list/get/replay (management) | SQL, outbound HTTP |
 | `api/submission_management.py` | Submission list/get/export (management) | SQL |
 | `api/security.py` | The management auth dependency | Route-specific logic |
+| `api/validation.py` | Shared request-boundary checks (NUL refusal) | Route-specific logic, SQL |
 | `api/pagination.py` | The shared cursor design | Table-specific queries |
 | `ingestion.py` | Endpoint ID and submission validation | HTTP, database |
 | `webhooks.py` | URL/SSRF validation, payload, signing, retry policy | HTTP, database |

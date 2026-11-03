@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -40,6 +41,11 @@ FORWARDED_FOR_HEADER = "X-Forwarded-For"
 # nothing can attribute is exactly what abuse looks like, so the safe reading is
 # the strict one.
 UNKNOWN_CLIENT = "unknown"
+
+# An IPv6 subscriber is routinely handed a whole /64 and can use any address in
+# it, so counting addresses one by one would give such a client 2**64 budgets.
+# The /64 is the smallest unit that reliably belongs to one subscriber.
+IPV6_BUCKET_PREFIX = 64
 
 
 class Limiter(StrEnum):
@@ -141,12 +147,61 @@ def client_address(*, peer: str | None, forwarded_for: str | None, trusted_proxy
     return peer or UNKNOWN_CLIENT
 
 
+def address_bucket(address: str) -> str:
+    """
+    reduce a resolved client address to the unit one budget is shared by
+    :param address: the address resolved for a request, possibly carrying a port
+    :returns: a canonical IPv4 address, an IPv6 /64 network, or the stripped input otherwise
+    """
+    # Every spelling of one source has to land in one bucket, or the spelling is
+    # a way out of the limit. A port changes with each connection a client opens,
+    # an IPv4 client can also appear as an IPv4-mapped IPv6 address, and an IPv6
+    # address can be written in more than one way. Without a proxy in front, an
+    # IPv6 client also picks its own source address from its /64 freely.
+    parsed = _parse_address(address)
+    if parsed is None:
+        # Not an address at all, such as the unknown-client marker or an
+        # obfuscated identifier some proxies write. It is counted as it stands.
+        return address.strip()
+    if isinstance(parsed, ipaddress.IPv6Address):
+        if parsed.ipv4_mapped is not None:
+            return str(parsed.ipv4_mapped)
+        # Built from the integer so a zone identifier, which says which local
+        # interface a link-local address was seen on, does not survive into it.
+        mask = ((1 << IPV6_BUCKET_PREFIX) - 1) << (128 - IPV6_BUCKET_PREFIX)
+        network = ipaddress.IPv6Network((int(parsed) & mask, IPV6_BUCKET_PREFIX))
+        return str(network)
+    return str(parsed)
+
+
+def _parse_address(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """
+    read an address out of the forms a peer or a forwarding header writes it in
+    :param value: an address, optionally with a port, an IPv6 address in brackets
+    :returns: the parsed address, or None if the value is not an address
+    """
+    candidate = value.strip()
+    if candidate.startswith("["):
+        # ``[2001:db8::1]`` or ``[2001:db8::1]:443``.
+        end = candidate.find("]")
+        if end == -1:
+            return None
+        candidate = candidate[1:end]
+    elif candidate.count(":") == 1:
+        # ``203.0.113.9:443``. More than one colon is a bare IPv6 address.
+        candidate = candidate.split(":", 1)[0]
+    try:
+        return ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+
+
 def ip_subject(address: str, secret: str | None) -> str:
     """
     reduce a client address to the value a counter may be keyed by
     :param address: the client address resolved for this request
     :param secret: server-side secret to key the digest with, or None for a plain digest
-    :returns: a hex SHA-256 digest of the address
+    :returns: a hex SHA-256 digest of the address's bucket, see address_bucket
     """
     # The raw address is never stored, never logged and never returned. What is
     # stored is a fixed-width digest of it, which is enough for the only thing the
@@ -163,6 +218,10 @@ def ip_subject(address: str, secret: str | None) -> str:
     # accounting rather than invalidating anything durable. That is the whole
     # operational problem it solves, and it is why the secret is optional rather
     # than required.
+    #
+    # The address is reduced to its bucket first, here rather than by each caller,
+    # so that nothing can compute a subject from an address it forgot to reduce.
+    bucket = address_bucket(address).encode("utf-8")
     if secret is None:
-        return hashlib.sha256(address.encode("utf-8")).hexdigest()
-    return hmac.new(secret.encode("utf-8"), address.encode("utf-8"), hashlib.sha256).hexdigest()
+        return hashlib.sha256(bucket).hexdigest()
+    return hmac.new(secret.encode("utf-8"), bucket, hashlib.sha256).hexdigest()

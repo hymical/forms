@@ -19,6 +19,7 @@ from typing import Annotated
 
 from fastapi import Query
 
+from hymical_forms.api.validation import NoNul
 from hymical_forms.errors import ApiError
 
 DEFAULT_PAGE_SIZE = 50
@@ -68,6 +69,7 @@ CursorQuery = Annotated[
         max_length=CURSOR_MAX_LENGTH,
         description="The `next_cursor` of the previous page. Omit it to read the first page.",
     ),
+    NoNul,
 ]
 
 

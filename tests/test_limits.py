@@ -143,3 +143,19 @@ def test_allows_newlines_inside_a_textarea_value(make_client: ClientFactory) -> 
     response = client.post(ENDPOINT, data={"message": "line one\r\nline two"})
 
     assert response.status_code == 202
+
+
+def test_rejects_an_oversized_streamed_body_on_a_json_route(make_client: ClientFactory) -> None:
+    # FastAPI reads a JSON body itself and turns any failure while reading into
+    # its own 400, so without help the cap surfaced here as a parse error rather
+    # than the documented 413.
+    client = make_client(max_body_bytes=64)
+
+    response = client.post(
+        "/endpoints",
+        content=_chunks(b'{"id": "contact-form", "name": "', b"x" * 200, b'"}'),
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_body_too_large"

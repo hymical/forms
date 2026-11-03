@@ -47,6 +47,7 @@ from hymical_forms.api.pagination import (
     next_cursor,
 )
 from hymical_forms.api.security import ManagementKeyDep
+from hymical_forms.api.validation import NoNul, contains_nul
 from hymical_forms.config import Settings
 from hymical_forms.db import SessionDep
 from hymical_forms.errors import ApiError, ErrorResponse
@@ -69,6 +70,7 @@ EndpointFilter = Annotated[
         max_length=ENDPOINT_ID_MAX_LENGTH,
         description="Only submissions for this endpoint. Omit for every endpoint.",
     ),
+    NoNul,
 ]
 
 ReceivedAfterFilter = Annotated[
@@ -443,6 +445,9 @@ def get_submission(
     :returns: the submission, its fields and the delivery it owes if it owes one
     :raises SubmissionNotFound: if no submission holds that identifier
     """
+    # A NUL names no submission, and would fail inside the driver as a 503.
+    if contains_nul(submission_id):
+        raise SubmissionNotFound(submission_id)
     record = storage.get_submission(session, submission_id)
     if record is None:
         raise SubmissionNotFound(submission_id)

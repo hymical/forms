@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import re
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -32,6 +33,11 @@ WEBHOOK_SECRET_MAX_LENGTH = len(WEBHOOK_SECRET_PREFIX) + 64
 
 WEBHOOK_URL_MAX_LENGTH = 2048
 ALLOWED_SCHEMES = ("http", "https")
+
+# Whitespace and control characters are never valid in a URL unencoded (RFC 3986
+# section 2), and the HTTP client refuses some of them only at send time, inside
+# the worker, long after the API has already accepted the destination.
+_UNSAFE_URL_CHARACTERS = re.compile(r"[\x00-\x20\x7f-\x9f]")
 
 DELIVERY_ATTEMPT_ID_PREFIX = "att_"
 DELIVERY_ATTEMPT_ID_MAX_LENGTH = len(DELIVERY_ATTEMPT_ID_PREFIX) + 32
@@ -175,17 +181,30 @@ def validate_webhook_url(url: str, *, allow_private_targets: bool = False) -> No
     if len(url) > WEBHOOK_URL_MAX_LENGTH:
         raise WebhookUrlRejected(f"must be at most {WEBHOOK_URL_MAX_LENGTH} characters")
 
+    if _UNSAFE_URL_CHARACTERS.search(url):
+        raise WebhookUrlRejected("must not contain spaces or control characters")
+
     try:
         parts = urlsplit(url)
         host = parts.hostname
+        # urlsplit rejects a malformed IPv6 literal straight away, but parses the
+        # port only when it is read, so it is read here to check it is a number
+        # in range. Left unchecked, the HTTP client refuses it inside the worker.
+        _ = parts.port
     except ValueError as exc:
-        # urlsplit rejects malformed IPv6 literals and out-of-range ports here.
         raise WebhookUrlRejected("must be a well-formed URL") from exc
 
     if parts.scheme not in ALLOWED_SCHEMES:
         raise WebhookUrlRejected("must use the http or https scheme")
     if not host:
         raise WebhookUrlRejected("must include a host")
+
+    try:
+        # Catches an empty label (``example..com``), a label over 63 characters
+        # and a non-ASCII name with no IDNA form, none of which can be connected to.
+        host.encode("idna")
+    except UnicodeError as exc:
+        raise WebhookUrlRejected("must have a valid host name") from exc
 
     if not allow_private_targets and _is_internal_host(host):
         raise WebhookUrlRejected(

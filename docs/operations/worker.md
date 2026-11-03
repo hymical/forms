@@ -94,6 +94,14 @@ dropped, the worker logs it and goes on to record the rest of the batch. The
 delivery it could not record stays claimed and is retried after its lease, so the
 destination may receive it twice.
 
+If one attempt fails in a way the HTTP client did not anticipate, such as a stored
+destination URL it refuses to send to, that failure is recorded against that
+delivery alone, as a `network_error` attempt that spends its allowance. Before
+this, the exception escaped the batch: nothing in it was recorded, the deliveries
+claimed alongside it were sent again each time their leases expired, and the
+failing one was claimed and failed forever without reaching its attempt limit.
+The worker log carries the full exception; the stored attempt message does not.
+
 ## Deploy order
 
 Stop the old processes, migrate, start the new ones. Migrating while an old build

@@ -959,6 +959,10 @@ def requeue_failed_delivery(session: Session, delivery_id: str, *, now: datetime
             update(delivery)
             .where(delivery.id == delivery_id)
             .where(delivery.state == DeliveryState.FAILED)
+            # A delivery whose submission was deleted has no payload to rebuild,
+            # and the worker never claims one, so requeueing it would park it in
+            # ``pending`` for good while reporting success.
+            .where(delivery.submission_id.is_not(None))
             .values(
                 state=DeliveryState.PENDING,
                 cycle_attempts=0,

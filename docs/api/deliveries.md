@@ -96,7 +96,7 @@ Takes no request body.
 | `200` | | Requeued. The body is the delivery's new state |
 | `401` | `authentication_required`, `invalid_api_key` | Credential missing or unusable |
 | `404` | `delivery_not_found` | No delivery with that ID exists |
-| `409` | `delivery_not_replayable` | The delivery is not in terminal `failed` |
+| `409` | `delivery_not_replayable` | The delivery is not in terminal `failed`, or its submission was deleted (`details.reason` is `submission_deleted`) |
 | `503` | `storage_unavailable` | The database could not be reached |
 
 `200`, not `202`: this request finishes here, and what it leaves behind is a

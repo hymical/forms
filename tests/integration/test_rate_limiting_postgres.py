@@ -141,6 +141,41 @@ def test_concurrent_attempts_from_one_source_cannot_exceed_its_allowance(
     assert len(stored) == IP_ALLOWANCE
 
 
+def test_concurrent_attempts_spread_over_one_ipv6_64_share_its_allowance(
+    postgres_url: str, migrated_engine: Engine, sessions: sessionmaker[Session]
+) -> None:
+    # Rotating through the subscriber's /64, and through spellings with a port or
+    # on separate header lines, must not be a way to multiply the allowance, even
+    # when every attempt lands on a different replica at the same instant.
+    attempts = 10
+    with sessions() as setup:
+        seed_endpoint(setup)
+
+    def rotated(index: int) -> dict[str, str]:
+        address = f"[2001:db8:7:7::{index + 1:x}]:{40000 + index}"
+        return {"X-Forwarded-For": f"198.51.100.{index}, {address}"}
+
+    statuses = fire_together(
+        postgres_url,
+        attempts,
+        headers_for=rotated,
+        trusted_proxy_hops=1,
+        rate_limit_ip_requests=IP_ALLOWANCE,
+        rate_limit_endpoint_requests=1000,
+    )
+
+    assert statuses.count(202) == IP_ALLOWANCE
+    assert statuses.count(429) == attempts - IP_ALLOWANCE
+    with sessions() as session:
+        rows = [
+            row
+            for row in session.scalars(select(models.RateLimitCounter))
+            if row.limiter == Limiter.IP
+        ]
+    assert len(rows) == 1
+    assert rows[0].attempts == attempts
+
+
 def test_concurrent_attempts_from_many_sources_cannot_exceed_the_endpoint_allowance(
     postgres_url: str, migrated_engine: Engine, sessions: sessionmaker[Session]
 ) -> None:

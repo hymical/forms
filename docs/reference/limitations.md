@@ -66,6 +66,11 @@ deploy it, and it is kept complete rather than flattering.
   `X-Forwarded-For` entries and pick its own. The default trusts nothing but the
   socket peer, which is the safe end to fail towards but is wrong behind a proxy.
   See [Reverse proxy](../operations/reverse-proxy.md).
+- **IPv6 clients are limited per `/64`, not per address.** One subscriber can
+  usually use every address in its `/64`, so that is the unit a budget is kept
+  for. Several hosts behind one `/64` share a budget; a client holding a larger
+  allocation, such as a `/48`, still has one budget per `/64` in it, which the
+  per-endpoint limit is what bounds.
 - **Rate limiting adds writes to the ingestion path.** Every public attempt costs
   one upsert per limiter, committed before the body is parsed. That is the price of
   a limit that is shared across processes rather than enforced per process, and it

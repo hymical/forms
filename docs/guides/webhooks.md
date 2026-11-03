@@ -160,8 +160,20 @@ link-local, multicast, reserved or unspecified address. That covers `localhost`,
 `127.0.0.1`, `[::1]`, `[::ffff:127.0.0.1]`, `10.0.0.0/8`, `192.168.0.0/16`, and
 the `169.254.169.254` cloud metadata endpoint.
 
+A URL must also be one the worker can actually send to: no spaces or control
+characters anywhere in it (percent-encode them), a port that is a number from 0
+to 65535, and a host name that is a valid DNS name, with no empty label as in
+`example..com`. Each of these used to be accepted here and then refused by the
+HTTP client inside the worker.
+
 Rejections return `422 invalid_webhook_url`. The same check runs on a destination
 supplied through `PATCH /endpoints/{endpoint_id}`.
+
+A delivery snapshots its destination, so a destination accepted before these
+checks existed can still be queued. The worker records each attempt at it as a
+`network_error` whose message begins `invalid destination URL`, and it ends
+`failed` once its attempts run out, like any other unreachable destination. It
+does not affect the other deliveries the worker claimed alongside it.
 
 !!! warning "This is not complete SSRF protection"
 

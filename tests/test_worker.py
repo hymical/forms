@@ -159,6 +159,25 @@ def test_the_signature_still_verifies_against_the_exact_bytes(
     assert delivered.headers["hymical-signature"] == f"v1={expected}"
 
 
+def test_a_retried_attempt_is_the_same_signed_event(
+    make_client: ClientFactory, webhook: WebhookRecorder
+) -> None:
+    # What a receiver deduplicates on has to survive a retry unchanged: the same
+    # bytes, so the same submission id, under the same signature.
+    client, _ = queued_client(make_client, webhook.url)
+    client.post(ENDPOINT, data={"email": "dev@example.com"})
+    webhook.status = 503
+    work_once(client, now=due_at(client))
+    webhook.status = 200
+    work_once(client, now=due_at(client))
+
+    assert len(webhook.received) == 2
+    first, second = webhook.received
+    assert first.body == second.body
+    assert first.headers["hymical-signature"] == second.headers["hymical-signature"]
+    assert delivery_of(client).state == DeliveryState.DELIVERED
+
+
 def test_a_successful_attempt_is_recorded(
     make_client: ClientFactory, webhook: WebhookRecorder
 ) -> None:
@@ -759,6 +778,78 @@ def test_one_failed_recording_does_not_lose_the_rest_of_the_batch(
     with open_session(client) as session:
         states = sorted(row.state for row in session.scalars(select(models.WebhookDelivery)))
     assert states == [DeliveryState.DELIVERED, DeliveryState.PROCESSING]
+
+
+def test_a_destination_the_client_cannot_use_does_not_poison_the_batch(
+    make_client: ClientFactory, webhook: WebhookRecorder
+) -> None:
+    # A destination stored before the validator learned to refuse it fails inside
+    # the HTTP client, before anything is sent. If that escapes the batch, nothing
+    # in it is recorded: every neighbour that was delivered is sent again when the
+    # lease runs out, and the bad delivery never spends its attempt allowance.
+    client, _ = queued_client(make_client, webhook.url, webhook_max_attempts=2)
+    client.post(ENDPOINT, data={"email": "first@example.com"})
+    client.post(ENDPOINT, data={"email": "second@example.com"})
+    with open_session(client) as session:
+        rows = list(session.scalars(select(models.WebhookDelivery)))
+        poisoned = rows[0].id
+        rows[0].destination_url = "http://127.0.0.1:port/hook"
+        session.commit()
+        latest = max(row.next_attempt_at for row in rows)
+
+    assert work_once(client, now=latest) == 2
+    assert len(webhook.received) == 1
+
+    later = latest + timedelta(hours=1)
+    work_once(client, now=later)
+    work_once(client, now=later + timedelta(hours=1))
+
+    assert len(webhook.received) == 1
+    with open_session(client) as session:
+        bad = session.get(models.WebhookDelivery, poisoned)
+        assert bad is not None
+        assert bad.state == DeliveryState.FAILED
+        assert bad.attempts == 2
+        good = session.scalars(
+            select(models.WebhookDelivery).where(models.WebhookDelivery.id != poisoned)
+        ).one()
+        assert good.state == DeliveryState.DELIVERED
+        assert good.attempts == 1
+    errors = [row.error for row in attempts_of(client) if row.delivery_id == poisoned]
+    assert len(errors) == 2
+    assert all(error is not None and "invalid destination URL" in error for error in errors)
+
+
+def test_an_unexpected_failure_in_one_attempt_is_recorded_against_it_alone(
+    make_client: ClientFactory, webhook: WebhookRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, _ = queued_client(make_client, webhook.url)
+    client.post(ENDPOINT, data={"email": "first@example.com"})
+    client.post(ENDPOINT, data={"email": "second@example.com"})
+    real = deliver
+    calls = 0
+
+    async def flaky(*args: Any, **kwargs: Any) -> DeliveryResult:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("/srv/secret/path exploded")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(worker, "deliver", flaky)
+    with open_session(client) as session:
+        latest = max(row.next_attempt_at for row in session.scalars(select(models.WebhookDelivery)))
+
+    assert work_once(client, now=latest) == 2
+
+    assert len(webhook.received) == 1
+    with open_session(client) as session:
+        states = sorted(row.state for row in session.scalars(select(models.WebhookDelivery)))
+    assert states == [DeliveryState.DELIVERED, DeliveryState.PENDING]
+    failed = [row for row in attempts_of(client) if row.outcome != "succeeded"]
+    assert len(failed) == 1
+    assert failed[0].error is not None
+    assert "/srv/secret/path" not in failed[0].error
 
 
 # --- starting up -------------------------------------------------------------

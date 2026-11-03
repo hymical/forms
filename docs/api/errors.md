@@ -33,13 +33,13 @@ names or SQL.
 | 409 | `endpoint_inactive` | Endpoint exists but is not accepting submissions |
 | 409 | `endpoint_already_exists` | Endpoint ID is already taken |
 | 409 | `idempotency_conflict` | Idempotency key already used for different content |
-| 409 | `delivery_not_replayable` | Delivery has not terminally failed |
-| 413 | `request_body_too_large` | Body exceeded `FORMS_MAX_BODY_BYTES` |
+| 409 | `delivery_not_replayable` | Delivery has not terminally failed, or its submission was deleted |
+| 413 | `request_body_too_large` | Body exceeded `FORMS_MAX_BODY_BYTES`, on any route, declared or streamed |
 | 415 | `unsupported_media_type` | Content type is not a supported form encoding |
 | 422 | `empty_submission` | No fields were submitted |
 | 422 | `invalid_cursor` | Pagination cursor does not continue from a known row |
 | 422 | `invalid_endpoint_id` | Endpoint ID in a request body breaks the ID rules |
-| 422 | `invalid_request` | Request body or query parameters failed schema validation |
+| 422 | `invalid_request` | Request body or query parameters failed schema validation, including a NUL character |
 | 422 | `invalid_webhook_url` | Webhook destination is malformed or not permitted |
 | 422 | `invalid_time_range` | `received_after` is not strictly earlier than `received_before` |
 | 422 | `export_too_large` | An export matches more than `FORMS_EXPORT_MAX_SUBMISSIONS` |

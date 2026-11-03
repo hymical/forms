@@ -23,12 +23,13 @@ from types import FrameType
 import httpx2
 from sqlalchemy.orm import Session, sessionmaker
 
-from hymical_forms import storage, webhooks
+from hymical_forms import models, storage, webhooks
 from hymical_forms.config import Settings
 from hymical_forms.db import create_engine_from_url, create_session_factory
 from hymical_forms.delivery import attempt_deadline_seconds, create_webhook_client, deliver
 from hymical_forms.models import utcnow
 from hymical_forms.schema import SchemaNotReady, verify_schema
+from hymical_forms.webhooks import DeliveryOutcome, DeliveryResult
 
 logger = logging.getLogger(__name__)
 
@@ -83,16 +84,7 @@ async def process_batch(
     }
     deadline = attempt_deadline_seconds(settings)
     results = await asyncio.gather(
-        *(
-            deliver(
-                client,
-                url=job.destination_url,
-                secret=job.signing_secret,
-                body=bodies[job.id],
-                deadline_seconds=deadline,
-            )
-            for job in claimed
-        )
+        *(_attempt(client, job, bodies[job.id], deadline_seconds=deadline) for job in claimed)
     )
 
     # One instant governs the whole batch: the claim, the attempt records and any
@@ -142,6 +134,44 @@ async def process_batch(
             )
 
     return len(claimed)
+
+
+# Stored on the attempt and returned by the deliveries API, so it is fixed text
+# rather than whatever the unexpected exception happened to say.
+UNEXPECTED_FAILURE = "could not send: the attempt failed unexpectedly, see the worker log"
+
+
+async def _attempt(
+    client: httpx2.AsyncClient,
+    job: models.WebhookDelivery,
+    body: bytes,
+    *,
+    deadline_seconds: float,
+) -> DeliveryResult:
+    """
+    make one delivery attempt whose failure, however it fails, stays its own
+    :param client: the outbound client deliveries are sent with
+    :param job: the claimed delivery being attempted
+    :param body: the exact bytes to sign and transmit
+    :param deadline_seconds: the longest the whole attempt may take
+    :returns: what the attempt produced, a network error if it raised
+    """
+    # ``deliver`` turns every failure it knows about into a result. This is for
+    # the ones it does not. Letting one escape the gather would abandon the whole
+    # batch unrecorded: neighbours that were already sent would be sent again
+    # when their leases ran out, and the one that raised would be claimed and
+    # raise again forever, never spending its attempt allowance.
+    try:
+        return await deliver(
+            client,
+            url=job.destination_url,
+            secret=job.signing_secret,
+            body=body,
+            deadline_seconds=deadline_seconds,
+        )
+    except Exception:
+        logger.exception("delivery %s attempt failed unexpectedly", job.id)
+        return DeliveryResult(DeliveryOutcome.NETWORK_ERROR, error=UNEXPECTED_FAILURE)
 
 
 async def run_worker(settings: Settings, *, stop: threading.Event) -> None:

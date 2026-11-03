@@ -118,6 +118,15 @@ def test_each_endpoint_gets_its_own_secret(
         ("empty", ""),
         ("no host", "https:///hook"),
         ("nonsense", "not a url at all"),
+        # Each of these passed the scheme and host checks and was then refused by
+        # the HTTP client in the worker, or could never be connected to at all.
+        ("a non-numeric port", "http://example.com:abc/hook"),
+        ("a port out of range", "http://example.com:99999/hook"),
+        ("a space in the host", "http://exa mple.com/hook"),
+        ("a tab in the host", "http://exa\tmple.com/hook"),
+        ("a space in the path", "http://example.com/a hook"),
+        ("an empty host label", "http://example..com/hook"),
+        ("an invalid IDNA host", "http://ex\u00e4mple..com/hook"),
     ],
 )
 def test_rejects_an_unusable_webhook_url(
@@ -131,6 +140,26 @@ def test_rejects_an_unusable_webhook_url(
 
     assert response.status_code == 422, description
     assert response.json()["error"]["code"] == "invalid_webhook_url"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://hooks.example.com:8443/in?token=abc%20def",
+        "https://b\u00fccher.example/hook",
+        "https://xn--bcher-kva.example/hook",
+        "https://example.com./hook",
+        "https://[2606:4700:4700::1111]:443/hook",
+    ],
+)
+def test_accepts_a_usable_webhook_url(make_client: ClientFactory, url: str) -> None:
+    client = make_client(seed_endpoint=False)
+
+    response = client.post(
+        "/endpoints", json={"id": "contact-form", "name": "C", "webhook_url": url}
+    )
+
+    assert response.status_code == 201, response.text
 
 
 @pytest.mark.parametrize(

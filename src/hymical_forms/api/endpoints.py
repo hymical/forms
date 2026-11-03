@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from http import HTTPStatus
+from typing import Annotated
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
@@ -26,6 +27,7 @@ from hymical_forms.api.pagination import (
     next_cursor,
 )
 from hymical_forms.api.security import ManagementKeyDep
+from hymical_forms.api.validation import NoNul
 from hymical_forms.config import Settings
 from hymical_forms.db import SessionDep
 from hymical_forms.errors import ApiError, ErrorResponse
@@ -125,7 +127,7 @@ class CreateEndpointRequest(BaseModel):
     """
 
     id: str = Field(description=ENDPOINT_ID_RULE)
-    name: str = Field(
+    name: Annotated[str, NoNul] = Field(
         min_length=1,
         max_length=ENDPOINT_NAME_MAX_LENGTH,
         description="Human-readable label, shown to whoever administers the endpoint.",
@@ -157,7 +159,7 @@ class UpdateEndpointRequest(BaseModel):
     # The endpoint's ID is deliberately not here. It is the primary key and it
     # appears in the action URL of every HTML form pointing at the endpoint, so
     # changing it would break deployed forms and orphan stored submissions.
-    name: str | None = Field(
+    name: Annotated[str | None, NoNul] = Field(
         default=None,
         min_length=1,
         max_length=ENDPOINT_NAME_MAX_LENGTH,
@@ -369,6 +371,11 @@ def get_endpoint(
     :returns: the endpoint, carrying no signing secret
     :raises EndpointNotFound: if no endpoint holds that identifier
     """
+    # An identifier that could never have been created names nothing, and is
+    # answered without a query. Some, such as one carrying a NUL character, would
+    # otherwise fail inside the driver and be misreported as an outage.
+    if not is_valid_endpoint_id(endpoint_id):
+        raise EndpointNotFound(endpoint_id)
     endpoint = storage.get_endpoint(session, endpoint_id)
     if endpoint is None:
         raise EndpointNotFound(endpoint_id)
@@ -405,6 +412,8 @@ def update_endpoint(
     # PATCH rather than PUT, because only a few fields are mutable and a PUT would
     # promise that the body describes the whole resource. It does not: the ID and
     # the existing signing secret are not the caller's to send.
+    if not is_valid_endpoint_id(endpoint_id):
+        raise EndpointNotFound(endpoint_id)
     endpoint = storage.get_endpoint_for_update(session, endpoint_id)
     if endpoint is None:
         raise EndpointNotFound(endpoint_id)

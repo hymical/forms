@@ -29,6 +29,7 @@ from hymical_forms.ratelimit import (
     UNKNOWN_CLIENT,
     Limiter,
     RateLimit,
+    address_bucket,
     client_address,
     ip_subject,
     seconds_until_window_ends,
@@ -767,6 +768,52 @@ def test_a_trusted_hop_falls_back_to_the_peer_without_a_header(
     assert submit(client) == 429
 
 
+def test_a_forwarding_header_split_across_lines_is_one_chain(
+    make_client: ClientFactory, clock: Clock
+) -> None:
+    # Some proxies, HAProxy's ``option forwardfor`` among them, add a header line
+    # of their own rather than extending the one the client sent. RFC 9110 reads
+    # repeated lines as one comma-separated list, and reading only the first line
+    # would count the request under an address the client wrote.
+    client = make_client(trusted_proxy_hops=1, rate_limit_ip_requests=1)
+
+    def chain(forged: str) -> list[tuple[str, str]]:
+        return [("X-Forwarded-For", forged), ("X-Forwarded-For", "203.0.113.9")]
+
+    assert submit(client, headers=chain("1.1.1.1")) == 202
+    assert submit(client, headers=chain("2.2.2.2")) == 429
+
+
+def test_a_source_port_does_not_open_a_new_bucket(make_client: ClientFactory, clock: Clock) -> None:
+    # Some proxies record the client's port alongside its address, and the port
+    # changes with every connection the client opens.
+    client = make_client(trusted_proxy_hops=1, rate_limit_ip_requests=1)
+
+    assert submit(client, headers=forwarded("203.0.113.9:50001")) == 202
+    assert submit(client, headers=forwarded("203.0.113.9:50002")) == 429
+    assert submit(client, headers=forwarded("[2001:db8::1]:50003")) == 202
+    assert submit(client, headers=forwarded("[2001:db8::1]:50004")) == 429
+
+
+def test_one_ipv6_64_is_one_bucket(make_client: ClientFactory, clock: Clock) -> None:
+    # A single IPv6 subscriber is routinely handed a whole /64 and can rotate
+    # through it freely, so counting each address separately is no limit at all.
+    client = make_client(trusted_proxy_hops=1, rate_limit_ip_requests=1)
+
+    assert submit(client, headers=forwarded("2001:db8:1:2::1")) == 202
+    assert submit(client, headers=forwarded("2001:db8:1:2:ffff:ffff:ffff:fffe")) == 429
+    assert submit(client, headers=forwarded("2001:db8:1:3::1")) == 202
+
+
+def test_one_address_spelled_differently_is_one_bucket(
+    make_client: ClientFactory, clock: Clock
+) -> None:
+    client = make_client(trusted_proxy_hops=1, rate_limit_ip_requests=1)
+
+    assert submit(client, headers=forwarded("203.0.113.9")) == 202
+    assert submit(client, headers=forwarded("::ffff:203.0.113.9")) == 429
+
+
 @pytest.mark.parametrize(
     ("peer", "forwarded_for", "hops", "expected"),
     [
@@ -854,3 +901,30 @@ def test_a_secret_changes_what_an_address_digests_to() -> None:
 
 def test_different_addresses_digest_differently() -> None:
     assert ip_subject("198.51.100.4", None) != ip_subject("198.51.100.5", None)
+
+
+@pytest.mark.parametrize(
+    ("address", "expected"),
+    [
+        ("198.51.100.4", "198.51.100.4"),
+        (" 198.51.100.4 ", "198.51.100.4"),
+        ("198.51.100.4:443", "198.51.100.4"),
+        ("::ffff:198.51.100.4", "198.51.100.4"),
+        ("[::ffff:198.51.100.4]:443", "198.51.100.4"),
+        ("2001:db8:1:2::1", "2001:db8:1:2::/64"),
+        ("2001:DB8:1:2:0:0:0:1", "2001:db8:1:2::/64"),
+        ("[2001:db8:1:2::1]:443", "2001:db8:1:2::/64"),
+        ("fe80::1%eth0", "fe80::/64"),
+        (UNKNOWN_CLIENT, UNKNOWN_CLIENT),
+        ("_hidden", "_hidden"),
+        ("[2001:db8::1", "[2001:db8::1"),
+    ],
+)
+def test_an_address_is_reduced_to_its_bucket(address: str, expected: str) -> None:
+    assert address_bucket(address) == expected
+
+
+def test_the_subject_is_taken_from_the_bucket() -> None:
+    assert ip_subject("2001:db8::1", None) == ip_subject("2001:db8::2", None)
+    assert ip_subject("198.51.100.4:1", "s" * 32) == ip_subject("198.51.100.4:2", "s" * 32)
+    assert ip_subject("2001:db8::1", None) != ip_subject("2001:db8:0:1::1", None)

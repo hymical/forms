@@ -475,3 +475,24 @@ def test_the_detail_route_shows_the_whole_history_after_a_replay(
     assert body["attempt_count"] == 2
     assert body["cycle_attempt_count"] == 1
     assert body["state"] == "delivered"
+
+
+def test_a_failed_delivery_whose_submission_was_deleted_is_not_replayable(
+    make_client: ClientFactory, webhook: WebhookRecorder
+) -> None:
+    # Removing one person's data means deleting their submission rows by hand,
+    # which unlinks the delivery. Requeueing that delivery would answer 200 for a
+    # delivery no worker can ever claim, leaving it pending for good.
+    client = failing_client(make_client, webhook)
+    delivery_id = fail_once(client, webhook)
+    with open_session(client) as session:
+        session.delete(session.scalars(select(models.Submission)).one())
+        session.commit()
+
+    response = client.post(REPLAY_PATH.format(delivery_id=delivery_id))
+
+    assert response.status_code == 409
+    error = response.json()["error"]
+    assert error["code"] == "delivery_not_replayable"
+    assert error["details"]["reason"] == "submission_deleted"
+    assert delivery_of(client).state == DeliveryState.FAILED

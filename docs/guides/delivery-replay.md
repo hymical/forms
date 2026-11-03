@@ -117,6 +117,13 @@ already reached its receiver. All three are refused with
 `409 delivery_not_replayable`, and the error names the state that made it
 ineligible.
 
+**A failed delivery whose submission has been deleted cannot be replayed either.**
+Retention never deletes such a submission, but deleting rows by hand does, and
+then there is no payload left to rebuild. That is also `409
+delivery_not_replayable`, with `"reason": "submission_deleted"` in `details`, and
+the delivery stays `failed`. Requeueing it instead would have reported success
+for a delivery no worker can ever claim.
+
 `200`, not `202`. A `202` would say this request will be carried out later, which
 invites reading the replay as the delivery. It is not. This request finishes here,
 and what it leaves behind is a queued row.
