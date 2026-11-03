@@ -4,7 +4,9 @@ the management authentication boundary on ``POST /endpoints``, and what stays pu
 
 from __future__ import annotations
 
+import hmac
 import logging
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -322,3 +324,100 @@ def test_a_management_authorization_header_never_reaches_a_webhook(
     assert "authorization" not in delivered.headers
     assert key not in str(delivered.headers)
     assert key.encode() not in delivered.body
+
+
+# --- every route is on one side of the boundary ------------------------------
+
+PUBLIC_ROUTES = {("POST", "/f/{endpoint_id}"), ("GET", "/health")}
+
+
+def operations(client: TestClient) -> list[tuple[str, str, dict[str, Any]]]:
+    """
+    list every operation the application serves, from its own OpenAPI document
+    :param client: the client whose application should be inspected
+    :returns: the method, path template and operation object of each route
+    """
+    # Read from the generated schema rather than from a list kept by hand, so a
+    # route added later is covered here without anybody remembering to add it.
+    schema = client.get("/openapi.json").json()
+    return [
+        (method.upper(), path, operation)
+        for path, item in schema["paths"].items()
+        for method, operation in item.items()
+    ]
+
+
+def concrete(path: str) -> str:
+    """
+    fill a path template's parameters with plausible values
+    :param path: a route's path template
+    :returns: a path the route will match
+    """
+    return (
+        path.replace("{endpoint_id}", "contact-form")
+        .replace("{delivery_id}", "whd_" + "0" * 32)
+        .replace("{submission_id}", "sub_" + "0" * 32)
+    )
+
+
+def test_every_route_declares_which_side_of_the_boundary_it_is_on(client: TestClient) -> None:
+    found = operations(client)
+    assert {(method, path) for method, path, _ in found} >= PUBLIC_ROUTES
+
+    for method, path, operation in found:
+        secured = operation.get("security") == [{"ManagementApiKey": []}]
+        assert secured is ((method, path) not in PUBLIC_ROUTES), f"{method} {path}"
+
+
+@pytest.mark.parametrize(
+    ("description", "headers"),
+    [
+        ("no credential", {}),
+        ("a well formed but unknown key", bearer(apikeys.new_management_key().key)),
+    ],
+)
+def test_every_management_route_refuses_a_request_that_does_not_authenticate(
+    make_client: ClientFactory, description: str, headers: dict[str, str]
+) -> None:
+    client = make_client(authenticate=False)
+    management = [(m, p) for m, p, _ in operations(client) if (m, p) not in PUBLIC_ROUTES]
+    assert management
+
+    for method, path in management:
+        response = client.request(method, concrete(path), headers=headers, json={})
+
+        assert response.status_code == 401, f"{description}: {method} {path}"
+
+
+def test_every_management_route_refuses_a_revoked_key(make_client: ClientFactory) -> None:
+    client = make_client(authenticate=False)
+    key = issue_management_key(client)
+    with open_session(client) as session:
+        stored = storage.find_management_key_by_digest(session, apikeys.digest_key(key))
+        assert stored is not None
+        storage.revoke_management_key(session, stored.id, now=utcnow())
+
+    for method, path, _ in operations(client):
+        if (method, path) in PUBLIC_ROUTES:
+            continue
+        response = client.request(method, concrete(path), headers=bearer(key), json={})
+
+        assert response.status_code == 401, f"{method} {path}"
+        assert response.json()["error"]["code"] == "invalid_api_key"
+
+
+def test_the_deciding_comparison_is_constant_time(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    compared: list[tuple[str, str]] = []
+    real = hmac.compare_digest
+
+    def spy(left: str, right: str) -> bool:
+        compared.append((left, right))
+        return real(left, right)
+
+    monkeypatch.setattr(hmac, "compare_digest", spy)
+
+    assert client.get("/endpoints").status_code == 200
+    assert len(compared) == 1
+    assert all(len(side) == apikeys.KEY_DIGEST_LENGTH for side in compared[0])
