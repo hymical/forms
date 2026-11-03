@@ -112,6 +112,15 @@ async def deliver(
         return DeliveryResult(
             DeliveryOutcome.NETWORK_ERROR, error=_describe("could not connect", exc)
         )
+    except httpx2.InvalidURL as exc:
+        # Raised while the request is being built, before anything is sent, and
+        # not a RequestError, so it needs its own clause. A destination stored
+        # before the validator learned to refuse it lands here. Recorded as an
+        # ordinary failed attempt so it spends the allowance and ends ``failed``
+        # rather than escaping the batch it was claimed in.
+        return DeliveryResult(
+            DeliveryOutcome.NETWORK_ERROR, error=_describe("invalid destination URL", exc)
+        )
     except TimeoutError:
         return DeliveryResult(
             DeliveryOutcome.TIMEOUT,
