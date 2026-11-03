@@ -77,6 +77,33 @@ your own it is the second from last, and so on.
 If the header is missing, or carries fewer entries than you configured, the
 socket peer is used instead rather than the header being half believed.
 
+If the header arrives on **more than one line**, the lines are read as one list,
+in order, as RFC 9110 defines. Some proxies, HAProxy's `option forwardfor` among
+them, add a line of their own rather than extending the one the client sent;
+reading only the first line would have counted the request under the address the
+client wrote.
+
+## One source, one bucket
+
+The address the chain resolves to is reduced to a bucket before it is counted, so
+that one source cannot appear as many:
+
+| Resolved address | Counted as |
+| --- | --- |
+| `203.0.113.9:50001` (a port, as some proxies record) | `203.0.113.9` |
+| `[2001:db8::1]:443` | `2001:db8::/64` |
+| `::ffff:203.0.113.9` (IPv4-mapped) | `203.0.113.9` |
+| `2001:db8:1:2::1` and `2001:db8:1:2:ffff::9` | `2001:db8:1:2::/64`, one bucket |
+| Anything that is not an address | itself |
+
+!!! note "IPv6 clients are limited per /64"
+
+    An IPv6 subscriber is routinely given a whole `/64` and can use any address
+    in it, so counting single IPv6 addresses would hand such a client 2^64
+    budgets. Every address in one `/64` shares one budget. The cost is that
+    several hosts in one `/64`, such as one office network, share it too; raise
+    `FORMS_RATE_LIMIT_IP_REQUESTS` if that matters more to you.
+
 ## Nothing else trusts the header
 
 `X-Forwarded-For` is used for rate limit accounting and nothing else. It does not

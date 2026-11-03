@@ -541,11 +541,16 @@ def _address_subject(request: Request, settings: Settings) -> str:
     work out the value this request's source address is counted under
     :param request: the incoming request
     :param settings: active configuration, read for the proxy and privacy settings
-    :returns: a hex digest of the resolved client address
+    :returns: a hex digest of the bucket the resolved client address belongs to
     """
+    # Every line of the header is read, not only the first. Some proxies add a
+    # line of their own rather than extending the one the client sent, and RFC
+    # 9110 section 5.3 defines repeated lines as one comma-separated list. Reading
+    # only the first would count the request under the line the client wrote.
+    forwarded_lines = request.headers.getlist(FORWARDED_FOR_HEADER)
     address = client_address(
         peer=request.client.host if request.client is not None else None,
-        forwarded_for=request.headers.get(FORWARDED_FOR_HEADER),
+        forwarded_for=", ".join(forwarded_lines) if forwarded_lines else None,
         trusted_proxy_hops=settings.trusted_proxy_hops,
     )
     return ip_subject(address, settings.rate_limit_ip_secret)

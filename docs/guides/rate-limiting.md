@@ -114,12 +114,20 @@ everything to the left of it was written by somebody who is not yours to trust.
 Set it to the real number of hops and never higher: a value larger than your
 actual chain lets a client insert entries and pick its own bucket. If the header
 is missing, or carries fewer entries than you configured, the socket peer is used
-instead rather than the header being half believed.
+instead rather than the header being half believed. A header sent on several
+lines is read as one list, in order.
+
+The resolved address is then reduced to the bucket it is counted in: a port is
+dropped, an IPv4-mapped IPv6 address counts as the IPv4 address it carries, and
+**an IPv6 address counts as its whole `/64`**, because one IPv6 subscriber is
+usually given a `/64` and could otherwise rotate through it for a fresh budget on
+every request. Several hosts sharing one `/64` share one budget as a result. See
+[Reverse proxy](../operations/reverse-proxy.md#one-source-one-bucket).
 
 ## How addresses are stored
 
-Addresses are stored as a SHA-256 digest, never as text, and no route or log line
-returns one.
+Addresses are stored as a SHA-256 digest of their bucket, never as text, and no
+route or log line returns one.
 
 Setting `FORMS_RATE_LIMIT_IP_SECRET` keys that digest with HMAC and makes it
 genuinely one way. Without it the digest is obfuscation only, because the IPv4
